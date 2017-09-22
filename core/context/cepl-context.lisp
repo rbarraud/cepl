@@ -4,31 +4,149 @@
 
 (defvar *contexts* nil)
 
-(defun+ make-context (&key gl-version (shared (first *contexts*))
-                           (title "CEPL") (width 600) (height 600)
-                           (fullscreen nil) (resizable t) (no-frame nil)
-                           (hidden nil))
-  (declare (ignore title width height fullscreen resizable no-frame hidden))
+(defun+ make-context (&key (gl-version t) (shared (first *contexts*)))
   ;;
   (assert (or (null shared) (typep shared 'cepl-context)))
+  (when shared
+    (error "cepl-context sharing not yet implmenent"))
   ;;
-  (let* ((shared (if shared
-                     (%cepl-context-shared shared)
-                     (make-instance 'cepl-context-shared)))
+  (let* ((gl-version (cond
+                       ((and (eq gl-version t) *contexts*)
+                        (let ((ctx (first *contexts*)))
+                          (if (> (%cepl-context-gl-version-float ctx) 0.0)
+                              (%cepl-context-gl-version-float ctx)
+                              (%cepl-context-requested-gl-version ctx))))
+                       ((eq gl-version t) nil)
+                       (t gl-version)))
+         (shared-arr (if shared
+                         (%cepl-context-shared shared)
+                         (make-array 0 :fill-pointer 0 :adjustable t)))
          (result (%make-cepl-context
-                  :gl-version gl-version
-                  :shared shared
+                  :requested-gl-version gl-version
                   :current-surface nil
+                  :shared shared-arr
                   :surfaces nil)))
-    (push result (slot-value shared 'members))
+    (vector-push-extend result (%cepl-context-shared result))
+    (when shared
+      (setf (%cepl-context-array-of-gpu-buffers result)
+            (%cepl-context-array-of-gpu-buffers shared))
+      (setf (%cepl-context-array-of-textures result)
+            (%cepl-context-array-of-textures shared)))
     (when cepl.host::*current-host*
       (on-host-initialized result))
     (push result *contexts*)
     ;; done!
     result))
 
+(defmacro with-new-cepl-context ((var-name &key shared (gl-version t))
+                                 &body body)
+  (alexandria:with-gensyms (new-context)
+    `(let (,new-context (make-context :gl-version ,gl-version
+                                      :shared ,shared))
+       (unwind-protect (with-cepl-context (,var-name ,new-context) ,@body)
+         (free-context ,new-context)))))
+
+(defun+ free-context (cepl-context)
+  (format t "free-context not yet implemented. Leaking ~a" cepl-context))
+
+;;----------------------------------------------------------------------
+;; Implicit Context & Inlining Logic
+
 (declaim (type cepl-context *cepl-context*))
 (defvar *cepl-context* (make-context))
+
+(defmacro l-identity (context)
+  "An identity macro. Exists so it can be shadowed in certain contexts"
+  ;; l for local..bad name, but the others I had at the time were worse.
+  context)
+
+(defun %inner-with-context (var-name cepl-context forgo-let body ctx-var)
+  (declare (optimize (speed 3) (safety 1) (debug 1) (compilation-speed 0)))
+  (if (eq cepl-context ctx-var)
+      (if var-name
+          `(let ((,var-name ,ctx-var))
+             (declare (ignorable ,var-name))
+             ,@body)
+          `(progn ,@body))
+      (%with-context var-name cepl-context forgo-let body ctx-var)))
+
+(defun %with-context (var-name cepl-context forgo-let body ctx-var)
+  (declare (optimize (speed 3) (safety 1) (debug 1) (compilation-speed 0)))
+  (assert (constantp forgo-let))
+  (let ((forgo-let (or forgo-let (eq cepl-context '(cepl-context))))
+        (ctx (or ctx-var (gensym "CTX"))))
+    `(let* ((,ctx ,cepl-context)
+            ,@(when var-name `((,var-name ,ctx)))
+            ,@(unless forgo-let `((*cepl-context* ,ctx))))
+       (declare (ignorable ,ctx))
+       (macrolet ((l-identity (context)
+                    (declare (ignore context))
+                    ',ctx)
+                  (with-cepl-context
+                      ((&optional var-name (cepl-context ',ctx) forgo-let)
+                       &body body)
+                    (%inner-with-context
+                     var-name cepl-context forgo-let body ',ctx)))
+         ,@body))))
+
+(defmacro with-cepl-context ((&optional var-name (cepl-context '(cepl-context))
+                                        forgo-let)
+                             &body body)
+  (%with-context var-name cepl-context forgo-let body nil))
+
+(defn-inline cepl-context () cepl-context
+  *cepl-context*)
+
+(define-compiler-macro cepl-context ()
+  `(l-identity *cepl-context*))
+
+;;----------------------------------------------------------------------
+;; Define Functions for interacting with the current context
+
+(defmacro define-context-func (name args ret-type context-slots &body body)
+  "This simple encodes a pattern I was writing too many times.
+   Basically we want to have the call to #'cepl-context inline
+   at the callsite as then a surrounding with-cepl-context block
+   will be able to replace it with a local version (improving performance)
+   the way we have taken to doing this "
+  (let* ((setfp (and (listp name) (eq (first name) 'setf)))
+         (hname (if setfp
+                    (symb-package (symbol-package (second name))
+                                  :%set- (second name))
+                    (symb-package (symbol-package name) :% name)))
+         (args-opt (if (find :&optional args :test #'symb-name=)
+                       args
+                       `(,@args &optional)))
+         (arg-symbs (mapcar
+                     (lambda (x) (if (listp x) (first x) x))
+                     args-opt))
+         (arg-names (remove-if
+                     (lambda (x) (char= #\& (char (symbol-name x) 0)))
+                     arg-symbs)))
+    (multiple-value-bind (body decls doc)
+        (alexandria:parse-body body :documentation t)
+      (let* ((not-inline (find 'not-inline-internals
+                               decls :key #'second :test #'string=))
+             (decls (remove not-inline decls))
+             (def (if not-inline 'defn 'defn-inline)))
+        `(progn
+           (,def ,hname (,@args (cepl-context cepl-context)) ,ret-type
+                 ,@(when doc (list doc))
+                 (declare (optimize (speed 3) (debug 0) (safety 1))
+                          (profile t))
+                 ,@decls
+                 (with-cepl-context (cepl-context cepl-context t)
+                   (%with-cepl-context-slots ,context-slots cepl-context
+                     ,@body)))
+           (defn ,name (,@args-opt (cepl-context cepl-context (cepl-context)))
+               ,ret-type
+             (declare (optimize (speed 3) (debug 1) (safety 1))
+                      (profile t))
+             (,hname ,@arg-names cepl-context))
+           (define-compiler-macro ,name (,@arg-symbs cepl-context)
+             (if cepl-context
+                 (list ',hname ,@arg-names cepl-context)
+                 (list ',hname ,@arg-names '(cepl-context)))))))))
 
 ;;----------------------------------------------------------------------
 
@@ -40,26 +158,30 @@
   (declare (profile t))
   (assert cepl-context)
   (assert surface)
-  (%with-cepl-context-slots (gl-context gl-version current-surface gl-thread) cepl-context
+  (%with-cepl-context-slots (gl-context gl-version-float requested-gl-version
+                                        current-surface gl-thread)
+      cepl-context
     (setf gl-thread (bt:current-thread))
     (assert (not gl-context))
-    (let ((raw-context (cepl.host:make-gl-context :version gl-version
+    (let ((raw-context (cepl.host:make-gl-context :version requested-gl-version
                                                   :surface surface)))
       (ensure-cepl-compatible-setup)
-      (let ((wrapped-context
+      (let* ((maj (gl:major-version))
+             (min (gl:minor-version))
+             (ver-f (float (+ maj (/ min 10)) 0f0))
+            (wrapped-context
              (make-instance
               'gl-context
               :handle raw-context
-              :version-major (gl:major-version)
-              :version-minor (gl:minor-version)
-              :version-float (coerce (+ (gl:major-version)
-                                        (/ (gl:minor-version) 10))
-                                     'single-float))))
+              :version-major maj
+              :version-minor min
+              :version-float ver-f)))
         ;;
         ;; hack until we support contexts properly
         (setf *gl-context* wrapped-context)
         ;;
         (setf gl-context wrapped-context)
+        (setf gl-version-float ver-f)
         ;;
         ;; {TODO} Hmm this feels wrong
         (map nil #'funcall *on-context*)
@@ -146,6 +268,31 @@
     (let ((id (%fbo-id fbo)))
       (ensure-vec-index fbos id +null-fbo+)
       (setf (aref fbos id) fbo))))
+
+(defn forget-gpu-buffer ((cepl-context cepl-context)
+                           (gpu-buffer gpu-buffer))
+    gpu-buffer
+  (declare (optimize (speed 3) (safety 1) (debug 1) (compilation-speed 0))
+           (profile t))
+  (%with-cepl-context-slots (array-of-gpu-buffers)
+      cepl-context
+    (setf (aref array-of-gpu-buffers (gpu-buffer-id gpu-buffer))
+          +null-gpu-buffer+)))
+
+(defn forget-texture ((cepl-context cepl-context) (texture texture))
+    texture
+  (declare (optimize (speed 3) (safety 1) (debug 1) (compilation-speed 0))
+           (profile t))
+  (%with-cepl-context-slots (array-of-textures)
+      cepl-context
+    (setf (aref array-of-textures (texture-id texture))
+          +null-texture+)))
+
+(defn forget-fbo ((cepl-context cepl-context) (fbo fbo)) fbo
+  (declare (optimize (speed 3) (safety 1) (debug 1) (compilation-speed 0))
+           (profile t))
+  (%with-cepl-context-slots (fbos) cepl-context
+    (setf (aref fbos (%fbo-id fbo)) +null-fbo+)))
 
 ;;----------------------------------------------------------------------
 ;; GPU-Buffers
@@ -459,54 +606,12 @@
 ;;----------------------------------------------------------------------
 
 (defn patch-uninitialized-context-with-version ((cepl-context cepl-context)
-                                                gl-version)
+                                                requested-gl-version)
     t
   (declare (optimize (speed 3) (safety 1) (debug 1) (compilation-speed 0))
            (profile t))
-  (when (not (%cepl-context-gl-version cepl-context))
-    (setf (%cepl-context-gl-version cepl-context) gl-version)))
+  (when (not (%cepl-context-requested-gl-version cepl-context))
+    (setf (%cepl-context-requested-gl-version cepl-context)
+          requested-gl-version)))
 
 ;;----------------------------------------------------------------------
-
-(defmacro l-identity (context)
-  "An identity macro. Exists so it can be shadowed in certain contexts"
-  ;; l for local..bad name, but the others I had at the time were worse.
-  context)
-
-(defun %inner-with-context (var-name cepl-context forgo-let body ctx-var)
-  (declare (optimize (speed 3) (safety 1) (debug 1) (compilation-speed 0)))
-  (if (eq cepl-context ctx-var)
-      (if var-name
-          `(let ((,var-name ,ctx-var))
-             ,@body)
-          `(progn ,@body))
-      (%with-context var-name cepl-context forgo-let body ctx-var)))
-
-(defun %with-context (var-name cepl-context forgo-let body ctx-var)
-  (declare (optimize (speed 3) (safety 1) (debug 1) (compilation-speed 0)))
-  (assert (constantp forgo-let))
-  (let ((ctx (or ctx-var (gensym "CTX"))))
-    `(let* ((,ctx ,cepl-context)
-            ,@(when var-name `((,var-name ,ctx)))
-            ,@(unless forgo-let `((*cepl-context* ,ctx))))
-       (declare (ignorable ,ctx))
-       (macrolet ((l-identity (context)
-                    (declare (ignore context))
-                    ',ctx)
-                  (with-cepl-context
-                      ((&optional var-name  (cepl-context ',ctx) forgo-let)
-                       &body body)
-                    (%inner-with-context
-                     var-name cepl-context forgo-let body ',ctx)))
-         ,@body))))
-
-(defmacro with-cepl-context ((&optional var-name (cepl-context '(cepl-context))
-                                        forgo-let)
-                             &body body)
-  (%with-context var-name cepl-context forgo-let body nil))
-
-(defn-inline cepl-context () cepl-context
-  *cepl-context*)
-
-(define-compiler-macro cepl-context ()
-  `(l-identity *cepl-context*))

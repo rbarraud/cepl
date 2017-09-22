@@ -1,8 +1,9 @@
-;;;; cepl.perf.core.asd
+;;;; cepl.build.asd
 
-(asdf:defsystem #:cepl.perf.core
+(asdf:defsystem #:cepl.build
   :description "Common package and system behind CEPL's profiling tools"
   :author "Chris Bagley <techsnuffle@gmail.com>"
   :license "BSD 2 Clause"
   :serial t
-  :components ((:file "perf/core/package")))
+  :components ((:file "build/package")
+               (:file "build/build")))

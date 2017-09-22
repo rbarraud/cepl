@@ -12,25 +12,15 @@
    (hidden :initarg :hidden)
    (legacy-gl-version :initarg :legacy-gl-version)))
 
-(defclass cepl-context-shared ()
-  ((members :initform nil))
-  ;; Things that arent shared between contexts
-  ;;
-  ;; FBOs
-  ;; VAOs
-  ;; Transform Feedback Objects
-  ;; Program Pipeline Objects (from seperable stages gl>=4.5)
-  )
-
 (defstruct (cepl-context (:constructor %make-cepl-context)
                          (:conc-name %cepl-context-))
   (gl-context nil :type (or null gl-context))
-  (gl-version nil :type t)
+  (requested-gl-version nil :type t)
+  (gl-version-float 0f0 :type single-float)
   (gl-thread nil :type (or null bt:thread))
   (uninitialized-resources nil :type list)
-  (shared
-   (error "Context must be initialized via #'make-context")
-   :type cepl-context-shared)
+  (shared (error "Context must be in-package via #'make-context")
+          :type (array cepl-context (*)))e
   (surfaces
    (error "Context must be initialized via #'make-context")
    :type list)
@@ -38,11 +28,17 @@
   (vao-binding-id +unknown-gl-id+ :type vao-id)
   (current-viewport nil :type (or null viewport))
   (default-viewport nil :type (or null viewport))
+  (current-scissor-viewports
+   (make-array 32 :element-type '(or null viewport) :initial-element nil)
+   :type (simple-array (or null viewport) (32)))
   (default-framebuffer nil :type (or null fbo))
   (read-fbo-binding nil :type (or null fbo))
   (draw-fbo-binding nil :type (or null fbo))
   (current-stencil-params-front nil :type (or null stencil-params))
   (current-stencil-params-back nil :type (or null stencil-params))
+  (current-stencil-mask-front #xFF :type stencil-mask)
+  (current-stencil-mask-back #xFF :type stencil-mask)
+  (current-blend-params nil :type (or null blending-params))
   (fbos
    (make-array 0 :element-type 'fbo :initial-element +null-fbo+
                :adjustable t :fill-pointer 0)
@@ -75,27 +71,33 @@
    (make-hash-table :test #'eq)
    :type hash-table)
   (depth-func :unknown :type (or symbol function))
-  (depth-mask :unknown :type (or symbol function))
+  (depth-mask nil :type boolean)
+  (color-masks (make-array 0 :element-type '(simple-array boolean (4)))
+               :type (simple-array (simple-array boolean (4)) (*)))
   (depth-range (v! 0 1) :type vec2)
-  (depth-clamp :unknown :type (or symbol function))
+  (depth-clamp nil :type boolean)
   (cull-face :unknown :type (or symbol function))
-  (front-face :unknown :type (or symbol function))
+  (front-face :unknown :type symbol)
   (clear-color (v! 0 0 0 0) :type vec4))
+
+(defmethod print-object ((context cepl-context) stream)
+  (format stream "#<CEPL-CONTEXT>"))
 
 (defmacro %with-cepl-context-slots (slots context &body body)
   (let ((context-slots
-         '(gl-context gl-version gl-thread uninitialized-resources shared
-           surfaces current-surface vao-binding-id current-viewport
-           default-viewport
+         '(gl-context requested-gl-version gl-thread uninitialized-resources
+           shared surfaces current-surface vao-binding-id current-viewport
+           default-viewport current-scissor-viewports
            default-framebuffer read-fbo-binding draw-fbo-binding fbos
            array-of-bound-gpu-buffers array-of-gpu-buffers
-           array-of-ubo-bindings-buffer-ids
+           array-of-ubo-bindings-buffer-ids current-blend-params
            array-of-transform-feedback-bindings-buffer-ids
            array-of-bound-samplers array-of-textures
-           map-of-pipeline-names-to-gl-ids depth-func
+           map-of-pipeline-names-to-gl-ids depth-func color-masks
            depth-mask depth-range depth-clamp cull-face front-face
            current-stencil-params-front current-stencil-params-back
-           clear-color)))
+           current-stencil-mask-front current-stencil-mask-back
+           clear-color gl-version-float)))
     (assert (every (lambda (x) (member x context-slots :test #'string=)) slots))
     (let ((slots (remove-duplicates slots))
           (accessors (loop :for slot :in slots :collect
@@ -115,3 +117,5 @@
 
 (defn current-surface ((cepl-context cepl-context)) t
   (%cepl-context-current-surface cepl-context))
+
+;;----------------------------------------------------------------------

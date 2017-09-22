@@ -424,6 +424,44 @@ to take (:patch 2) and points to pipelines taking (:patch 1)"
   name stream-prim
   pline-prim pline-prim)
 
+(deferror invalid-options-for-texture ()
+    (buffer-storage
+     cubes dimensions layer-count mipmap multisample rectangle)
+    "CEPL: We could not establish the correct texture type for the following
+combination of options:
+
+buffer-storage - ~a
+cubes          - ~a
+dimensions     - ~a
+layer-count    - ~a
+mipmap         - ~a
+multisample    - ~a
+rectangle      - ~a
+
+If the GL spec says this is valid then we are sorry for the mistake. If you
+have the time please report the issue here:
+https://github.com/cbaggers/cepl/issues"
+  buffer-storage cubes dimensions layer-count mipmap multisample rectangle)
+
+(deferror gpu-func-symbol-name () (name alternatives env)
+    "CEPL: We were asked to find the gpu function named ~a. Now we did find
+~a however as gpu-functions can be overloaded we now require that you specify
+the types along with the name. This is slightly more annoying when there is
+only one match, however it eliminates the ambiguity that occurs as soon as
+someone does overload the gpu-function.
+
+Here are the possible names for this function:
+~{~a~}
+~@[
+You may pick a implementation to use this time but, as this will not update
+your code, you will get this error on the next compile unless it is fixed~]"
+  name
+  (if (> (length alternatives) 1)
+      "matches"
+      "a match")
+  alternatives
+  (not (null env)))
+
 ;; Please remember the following 2 things
 ;;
 ;; - add your condition's name to the package export

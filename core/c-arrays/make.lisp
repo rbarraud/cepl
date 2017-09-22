@@ -5,7 +5,11 @@
 (defun+ valid-c-array-dimension-p (x)
   (>= x 0))
 
-(defun+ make-c-array-from-pointer (dimensions element-type pointer)
+(defun+ make-c-array-from-pointer (dimensions
+                                   element-type
+                                   pointer
+                                   &key
+                                   (free #'cffi:foreign-free))
   (assert dimensions ()
           "dimensions are not optional when making an array from a pointer")
   (let ((dimensions (listify dimensions)))
@@ -28,7 +32,8 @@
          :row-byte-size row-byte-size
          :element-pixel-format (when p-format element-type)
          :element-from-foreign (get-typed-from-foreign element-type2)
-         :element-to-foreign (get-typed-to-foreign element-type2))))))
+         :element-to-foreign (get-typed-to-foreign element-type2)
+         :free free)))))
 
 ;;------------------------------------------------------------
 
@@ -107,11 +112,11 @@
 
 (defmacro with-c-array-freed ((var-name c-array) &body body)
   `(let* ((,var-name ,c-array))
-     (unwind-protect (progn ,@body) (free-c-array ,var-name))))
+     (release-unwind-protect (progn ,@body) (free-c-array ,var-name))))
 
 (defmacro with-c-arrays-freed ((var-name c-arrays) &body body)
   `(let* ((,var-name ,c-arrays))
-     (unwind-protect (progn ,@body)
+     (release-unwind-protect (progn ,@body)
        (loop :for a :in ,var-name :do (free-c-array a)))))
 
 ;;------------------------------------------------------------

@@ -37,6 +37,9 @@
 (deftype attachment-name ()
   '(or attachment-num symbol))
 
+(deftype stencil-mask ()
+  '(unsigned-byte 8))
+
 (defun+ indexp (x)
   (typep x 'c-array-index))
 
@@ -65,7 +68,9 @@
    :type function)
   (element-to-foreign
    (error "cepl: c-array must be created with a to-foreign function")
-   :type (function (foreign-pointer t) t)))
+   :type (function (foreign-pointer t) t))
+  (free #'cffi:foreign-free
+   :type function))
 
 ;;------------------------------------------------------------
 
@@ -80,9 +85,11 @@
   (cubes-p nil :type boolean)
   (allocated-p nil :type boolean)
   (mutable-p nil :type boolean)
+  (samples 0 :type (unsigned-byte 32))
+  (fixed-sample-locations-p nil :type boolean)
   ;; last-sampler-id is used for perf optimizations
   ;; on gl v<3.3
-  (last-sampler-id 0 :type real))
+  (last-sampler-id 0 :type (signed-byte 32)))
 
 (defvar +null-texture+
   (%%make-texture :type nil
@@ -219,9 +226,9 @@
                            (:conc-name %stencil-params-))
   (test #.(gl-enum :never) :type (signed-byte 32) :read-only t)
 
-  (value 0 :type (unsigned-byte 8) :read-only t)
+  (value 0 :type stencil-mask :read-only t)
 
-  (mask 0 :type (unsigned-byte 8) :read-only t)
+  (mask 0 :type stencil-mask :read-only t)
 
   (on-stencil-test-fail
    #.(gl-enum :keep) :type (signed-byte 32) :read-only t)
@@ -255,6 +262,7 @@
                             :fill-pointer 0)
                 :type (array att *))
   (depth-array (make-att) :type att)
+  (stencil-array (make-att) :type att)
   ;;
   (draw-buffer-map
    (error "draw-buffer array must be provided when initializing an fbo"))

@@ -24,7 +24,8 @@
    (geometry-stage
     :initarg :geometry-stage :initform nil)
    (fragment-stage
-    :initarg :fragment-stage :initform nil)))
+    :initarg :fragment-stage :initform nil)
+   prog-id))
 
 (defclass gpu-func-spec ()
   ((name :initarg :name)
@@ -337,13 +338,15 @@ names are depended on by the functions named later in the list"
 
 (defmethod %gpu-function ((name symbol))
   (let ((choices (gpu-functions name)))
-    (case= (length choices)
-      (0 (error 'gpu-func-spec-not-found :name name :types nil))
-      (1 (%gpu-function (first choices)))
-      (otherwise (restart-case
-                     (error 'multi-func-error :name name :choices choices)
-                   (use-value ()
-                     (%gpu-function (interactive-pick-gpu-function name))))))))
+    (if (> (length choices) 0)
+        (restart-case
+            (error 'gpu-func-symbol-name
+                   :name name
+                   :alternatives choices
+                   :env t)
+          (use-value ()
+            (%gpu-function (interactive-pick-gpu-function name))))
+        (error 'gpu-func-spec-not-found :name name :types nil))))
 
 (defmethod %gpu-function ((name null))
   (error 'gpu-func-spec-not-found :name name :types nil))
@@ -400,7 +403,10 @@ names are depended on by the functions named later in the list"
                    :context context)))
 
 (defun+ pipeline-spec (name)
-  (gethash name *gpu-pipeline-specs*))
+  (let ((res (gethash name *gpu-pipeline-specs*)))
+    (if (and res (symbolp res))
+        (pipeline-spec res)
+        res)))
 
 (defun+ (setf pipeline-spec) (value name)
   (setf (gethash name *gpu-pipeline-specs*) value))
@@ -536,11 +542,5 @@ names are depended on by the functions named later in the list"
 
 (let ((current-key 0))
   (defun %gen-pass-key () (incf current-key)))
-
-;;--------------------------------------------------
-
-(defmethod free ((function function))
-  (warn "CEPL: Free has not yet been implemented for pipelines.
-Please bug me to work on this issue: https://github.com/cbaggers/cepl/issues/130"))
 
 ;;--------------------------------------------------

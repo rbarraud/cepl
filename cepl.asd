@@ -25,7 +25,7 @@
                #:rtg-math.vari
                #:closer-mop
                #:bordeaux-threads
-               #:cepl.perf.core)
+               #:cepl.build)
   :components ((:file "package")
                (:file "host/api-api")
                (:file "host/api-generics")
@@ -46,8 +46,14 @@
                (:file "core/context/cepl-context")
                (:file "core/context/surface")
                (:file "core/context/delayed-resource-init")
-               (:file "core/context/capabilities")
                (:file "core/context/version")
+               (:file "core/blending/blending")
+               (:file "core/stencil/stencil")
+               (:file "core/stencil/mask")
+               (:file "core/scissor/scissor")
+               (:file "core/color/color")
+               (:file "core/depth/depth")
+               (:file "core/face/face")
                (:file "core/types/initalized-p")
                (:file "core/internals")
                (:file "core/types/types")
@@ -90,8 +96,6 @@
                (:file "core/gpu-arrays/with-and-push")
                (:file "core/fbos/fbo")
                (:file "core/ubos/ubo")
-               (:file "core/blending/blending")
-               (:file "core/stencil/stencil")
                (:file "core/types/predefined/gpu-structs")
                (:file "core/context/make")
                (:file "core/repl")

@@ -24,9 +24,6 @@
 (defmacro def-g-> (name context &body gpipe-args)
   `(defpipeline-g ,name ,context ,@gpipe-args))
 
-(defun+ foop ()
-  (values 1 2 3))
-
 (defmacro defpipeline-g (name context &body gpipe-args)
   (assert-valid-gpipe-form name gpipe-args)
   (%defpipeline-gfuncs name gpipe-args context))
@@ -274,6 +271,7 @@
               ',name ',primitive ,(serialize-stage-pairs stage-pairs))
            (declare (ignorable compiled-stages))
            (setf prog-id new-prog-id)
+           (setf (slot-value (pipeline-spec ',name) 'prog-id) prog-id)
            (use-program prog-id)
            (setf implicit-uniform-upload-func
                  (or (%create-implicit-uniform-uploader compiled-stages
@@ -492,7 +490,7 @@
   "Links all the shaders provided and returns an opengl program
    object. Will recompile an existing program if ID is provided"
   (let ((program (or program_id (%gl:create-program))))
-    (unwind-protect
+    (release-unwind-protect
          (progn (loop :for shader :in shaders :do
                    (%gl:attach-shader program shader))
                 (%gl:link-program program)
@@ -504,3 +502,14 @@
       (loop :for shader :in shaders :do
          (gl:detach-shader program shader)))
     program))
+
+(defmethod free ((pipeline-name symbol))
+  (free-pipeline pipeline-name))
+
+(defmethod free ((pipeline-func function))
+  (free-pipeline pipeline-func))
+
+(defun+ free-pipeline (pipeline)
+  (with-slots (prog-id) (pipeline-spec pipeline)
+    (gl:delete-program prog-id)
+    (setf prog-id nil)))

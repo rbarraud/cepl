@@ -26,7 +26,7 @@
       (setf current-viewport viewport)
       t)))
 
-(defn-inline %current-viewport ((cepl-context cepl-context)) viewport
+(defn-inline %current-viewport ((cepl-context cepl-context)) (or null viewport)
   (declare (optimize (speed 3) (debug 1) (safety 1))
            (profile t))
   (%with-cepl-context-slots (current-viewport) cepl-context
@@ -43,11 +43,6 @@
                       (symbol-value '*gl-context*))
                  "but we do have a gl context. This is a bug"
                  "because the GL context is not yet available"))))
-
-(define-compiler-macro current-viewport (&whole whole &optional cepl-context)
-  (if (null cepl-context)
-      `(%current-viewport (cepl-context))
-      whole))
 
 ;;------------------------------------------------------------
 
@@ -105,14 +100,27 @@
 
 ;;------------------------------------------------------------
 
-(defun+ viewport-origin (viewport)
-  (v! (%viewport-origin-x viewport)
-      (%viewport-origin-y viewport)))
+(defn viewport-origin ((viewport viewport)) vec2
+  (declare (optimize (speed 3) (debug 1) (safety 1))
+           (inline %current-viewport)
+           (profile t))
+  (v2:make (float (%viewport-origin-x viewport) 0f0)
+           (float (%viewport-origin-y viewport) 0f0)))
 
-(defun+ (setf viewport-origin) (value viewport)
+(defn (setf viewport-origin) ((value (or vec2 uvec2)) (viewport viewport))
+    (or vec2 uvec2)
+  (declare (optimize (speed 3) (debug 1) (safety 1))
+           (inline %current-viewport)
+           (profile t))
   (setf (%viewport-origin-x viewport) (floor (v:x value))
         (%viewport-origin-y viewport) (floor (v:y value)))
   value)
+
+(defmethod origin ((viewport viewport))
+  (viewport-origin viewport))
+
+(defmethod (setf origin) (value (viewport viewport))
+  (setf (viewport-origin viewport) value))
 
 ;;------------------------------------------------------------
 
@@ -122,7 +130,7 @@
        (let* ((,old-viewport (current-viewport))
               (,vp ,viewport)
               (,unbind (%set-current-viewport ,ctx ,vp)))
-         (unwind-protect (progn ,@body)
+         (release-unwind-protect (progn ,@body)
            (when ,unbind
              (%set-current-viewport ,ctx ,old-viewport)))))))
 
