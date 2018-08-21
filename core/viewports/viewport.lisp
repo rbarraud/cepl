@@ -21,8 +21,8 @@
   (%with-cepl-context-slots (current-viewport) cepl-context
     (unless (eq current-viewport viewport)
       (%gl:viewport
-        (%viewport-origin-x viewport) (%viewport-origin-y viewport)
-        (%viewport-resolution-x viewport) (%viewport-resolution-y viewport))
+       (%viewport-origin-x viewport) (%viewport-origin-y viewport)
+       (%viewport-resolution-x viewport) (%viewport-resolution-y viewport))
       (setf current-viewport viewport)
       t)))
 
@@ -39,10 +39,12 @@
            (profile t))
   (or (%current-viewport cepl-context)
       (error "No current viewport found ~a"
-             (if (and (boundp '*gl-context*)
-                      (symbol-value '*gl-context*))
+             (if (and (cepl-context)
+                      (cepl.context::%cepl-context-gl-context (cepl-context)))
                  "but we do have a gl context. This is a bug"
                  "because the GL context is not yet available"))))
+
+
 
 ;;------------------------------------------------------------
 
@@ -71,13 +73,28 @@
 (defmethod (setf resolution) (value (viewport viewport))
   (setf (viewport-resolution viewport) value))
 
-(defn viewport-resolution ((viewport viewport)) rtg-math.types:vec2
+
+(defn-inline viewport-resolution-x ((viewport viewport)) single-float
+  (float (%viewport-resolution-x viewport) 0f0))
+
+(defn-inline viewport-resolution-y ((viewport viewport)) single-float
+  (float (%viewport-resolution-y viewport) 0f0))
+
+(defn-inline viewport-origin-x ((viewport viewport)) single-float
+  (float (%viewport-origin-x viewport) 0f0))
+
+(defn-inline viewport-origin-y ((viewport viewport)) single-float
+  (float (%viewport-origin-y viewport) 0f0))
+
+(defn viewport-resolution ((viewport viewport)) vec2
   (declare (profile t))
-  (v2:make (float (%viewport-resolution-x viewport))
-           (float (%viewport-resolution-y viewport))))
+  (vec2 (viewport-resolution-x viewport)
+        (viewport-resolution-y viewport)))
 
 (defn (setf viewport-resolution) ((value vec2) (viewport viewport)) vec2
-  (%set-resolution viewport (floor (v:x value)) (floor (v:y value)))
+  (%set-resolution viewport
+                   (floor (aref value 0))
+                   (floor (aref value 1)))
   (when (eq viewport (current-viewport))
     (%gl:viewport
      (%viewport-origin-x viewport) (%viewport-origin-y viewport)
@@ -89,14 +106,25 @@
         (%viewport-resolution-y viewport) y)
   (%with-cepl-context-slots (default-viewport) (cepl-context)
     (when (eq viewport default-viewport)
-      (cepl.fbos::%update-default-framebuffer-dimensions x y)))
+      (%update-default-framebuffer-dimensions x y)))
   (values))
 
-(defun+ viewport-resolution-x (viewport)
-  (%viewport-resolution-x viewport))
-
-(defun+ viewport-resolution-y (viewport)
-  (%viewport-resolution-y viewport))
+;; whilst this is an fbo function it lives here to avoid the circular
+;; dependency that would result otherwise
+(defun+ %update-default-framebuffer-dimensions (x y)
+  (%with-cepl-context-slots (default-framebuffer) (cepl-context)
+    (let ((dimensions (list x y))
+          (fbo default-framebuffer))
+      (map nil
+           (lambda (x)
+             (setf (gpu-array-dimensions (att-array x)) dimensions)
+             (setf (viewport-dimensions (att-viewport x)) dimensions))
+           (%fbo-color-arrays fbo))
+      (when (%fbo-depth-array fbo)
+        (let ((arr (%fbo-depth-array fbo)))
+          (setf (gpu-array-dimensions (att-array arr)) dimensions)
+          (setf (viewport-dimensions (att-viewport arr)) dimensions)))
+      fbo)))
 
 ;;------------------------------------------------------------
 
@@ -104,16 +132,16 @@
   (declare (optimize (speed 3) (debug 1) (safety 1))
            (inline %current-viewport)
            (profile t))
-  (v2:make (float (%viewport-origin-x viewport) 0f0)
-           (float (%viewport-origin-y viewport) 0f0)))
+  (vec2 (float (%viewport-origin-x viewport) 0f0)
+        (float (%viewport-origin-y viewport) 0f0)))
 
 (defn (setf viewport-origin) ((value (or vec2 uvec2)) (viewport viewport))
     (or vec2 uvec2)
   (declare (optimize (speed 3) (debug 1) (safety 1))
            (inline %current-viewport)
            (profile t))
-  (setf (%viewport-origin-x viewport) (floor (v:x value))
-        (%viewport-origin-y viewport) (floor (v:y value)))
+  (setf (%viewport-origin-x viewport) (floor (aref value 0))
+        (%viewport-origin-y viewport) (floor (aref value 1)))
   value)
 
 (defmethod origin ((viewport viewport))
@@ -139,21 +167,18 @@
 ;;       you can however create other viewports and with with-viewport
 ;;       to make them current, then rendering with render to that viewport
 
-(defmacro with-fbo-viewport ((fbo &optional (attachment 0)) &body body)
-  `(with-viewport (cepl.fbos:attachment-viewport ,fbo ,attachment)
+(defmacro with-fbo-viewport ((fbo &optional (attachment-for-size 0))
+                             &body body)
+  `(with-viewport (cepl.fbos::attachment-viewport-allowing-t
+                   ,fbo
+                   ,attachment-for-size)
      ,@body))
-
-(defmacro %with-fbo-viewport ((fbo &optional (attachment 0)) &body body)
-  "To be used by code than is managing the viewport state itself.
-   composed dispatch would be an example"
-  `(%with-viewport (cepl.fbos:attachment-viewport ,fbo ,attachment)
-                   ,@body))
 
 
 (defn viewport-params-to-vec4 (&optional (viewport viewport (current-viewport)))
     vec4
   (declare (profile t))
-  (v4:make (float (%viewport-origin-x viewport) 0f0)
-           (float (%viewport-origin-y viewport) 0f0)
-           (float (%viewport-resolution-x viewport) 0f0)
-           (float (%viewport-resolution-y viewport) 0f0)))
+  (vec4 (float (%viewport-origin-x viewport) 0f0)
+        (float (%viewport-origin-y viewport) 0f0)
+        (float (%viewport-resolution-x viewport) 0f0)
+        (float (%viewport-resolution-y viewport) 0f0)))

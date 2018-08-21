@@ -1,5 +1,4 @@
 (in-package :cepl.context)
-(in-readtable :fn.reader)
 
 ;;----------------------------------------------------------------------
 
@@ -33,7 +32,15 @@
                 (list surface))))
     (when make-current
       (make-surface-current context surface))
-    context))
+    surface))
+
+;;----------------------------------------------------------------------
+
+(defun remove-surface (context surface)
+  (%with-cepl-context-slots (surfaces) context
+    (assert (find surface surfaces))
+    (setf surfaces (remove surface surfaces))
+    (cepl.host:destroy-surface surface)))
 
 ;;----------------------------------------------------------------------
 
@@ -57,9 +64,10 @@
 (defun+ init-pending-surfaces (context)
   (%with-cepl-context-slots (surfaces) context
     (setf surfaces
-          (mapcar λ(typecase _
-                     (pending-surface (make-surface-from-pending _))
-                     (t _))
+          (mapcar (lambda (x)
+                    (typecase x
+                      (pending-surface (make-surface-from-pending x))
+                      (t x)))
                   surfaces))))
 
 (defun+ make-surface-from-pending (pending-surface)
@@ -82,7 +90,9 @@
   (cepl.host:window-size surface))
 
 (defun+ surface-resolution (surface)
-  (v! (cepl.host:window-size surface)))
+  (let ((data (mapcar #'float (cepl.host:window-size surface))))
+    (make-array (length data) :element-type 'single-float
+                :initial-contents data)))
 
 (defun+ (setf surface-dimensions) (value surface)
   (destructuring-bind (width height) value
@@ -90,8 +100,8 @@
 
 (defun+ (setf surface-resolution) (value surface)
   (cepl.host:set-surface-size surface
-                              (ceiling (v:x value))
-                              (ceiling (v:y value))))
+                              (ceiling (aref value 0))
+                              (ceiling (aref value 1))))
 
 (defun+ surface-title (surface)
   (cepl.host:surface-title surface))

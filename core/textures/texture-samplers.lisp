@@ -26,19 +26,25 @@
     (%gl:tex-parameter-f (texture-type texture) :texture-max-lod value))
   texture)
 
+(defun+ (setf border-color) (value texture)
+  (cffi-sys:with-pointer-to-vector-data (ptr value)
+    #+sbcl(declare (sb-ext:muffle-conditions sb-ext:compiler-note))
+    (%with-scratch-texture-bound texture
+      (%gl:tex-parameter-fv (texture-type texture) :texture-border-color ptr)))
+  texture)
 
 (defun+ (setf tex-magnify-filter) (value texture)
   (assert (member value '(:linear :nearest)))
   (%with-scratch-texture-bound texture
     (%gl::tex-parameter-i (texture-type texture) :texture-mag-filter
-                          (%gl::foreign-enum-value '%gl:enum value)))
+                          (gl-enum value)))
   texture)
 
 
 (defun+ (setf tex-minify-filter) (value texture)
   (%with-scratch-texture-bound texture
     (%gl::tex-parameter-i (texture-type texture) :texture-min-filter
-                          (%gl::foreign-enum-value '%gl:enum value)))
+                          (gl-enum value)))
   texture)
 
 (defun+ (setf tex-wrap) (value texture)
@@ -52,11 +58,11 @@
                  (every (lambda (x) (member x options)) value)))
     (%with-scratch-texture-bound texture
       (%gl::tex-parameter-i (texture-type texture) :texture-wrap-s
-                            (%gl::foreign-enum-value '%gl:enum (aref value 0)))
+                            (gl-enum (aref value 0)))
       (%gl::tex-parameter-i (texture-type texture) :texture-wrap-t
-                            (%gl::foreign-enum-value '%gl:enum (aref value 1)))
+                            (gl-enum (aref value 1)))
       (%gl::tex-parameter-i (texture-type texture) :texture-wrap-r
-                            (%gl::foreign-enum-value '%gl:enum (aref value 2)))))
+                            (gl-enum (aref value 2)))))
   texture)
 
 
@@ -66,12 +72,10 @@
         (progn
           (%gl:tex-parameter-i
            (texture-type texture) :texture-compare-mode
-           (%gl::foreign-enum-value
-            '%gl:enum :compare-ref-to-texture))
+           (gl-enum :compare-ref-to-texture))
           (%gl:tex-parameter-i
            (texture-type texture) :texture-compare-func
-           (%gl::foreign-enum-value
-            '%gl:enum
+           (gl-enum
             (case value
               ((:never nil) :never)
               ((:always t) :always)
@@ -84,7 +88,7 @@
               (otherwise (error "Invalid compare func for texture ~a" value))))))
         (%gl:tex-parameter-i
          (texture-type texture) :texture-compare-mode
-         (%gl::foreign-enum-value '%gl:enum :none))))
+         (gl-enum :none))))
   texture)
 
 (defun+ fallback-sampler-set (sampler)
@@ -97,5 +101,6 @@
             (tex-minify-filter texture) (%sampler-minify-filter sampler)
             (tex-magnify-filter texture) (%sampler-magnify-filter sampler)
             (tex-wrap texture) (%sampler-wrap sampler)
+            (border-color texture) (%sampler-border-color sampler)
             (tex-compare texture) (%sampler-compare sampler)))
     sampler))

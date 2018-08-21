@@ -22,7 +22,7 @@
             (destination-alpha (blending-params-destination-alpha ,g)))
          ,@body))))
 
-(defvar *blend-color* (v! 0 0 0 0))
+
 
 (defun+ blend-func-namep (keyword)
   (not (null (member keyword '(:zero
@@ -45,6 +45,75 @@
                                :src1-alpha
                                :one-minus-src1-alpha)))))
 
+;;----------------------------------------------------------------------
+
+(defun+ mode-rgb (fbo &optional attachment-name)
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    mode-rgb))
+
+(defun+ mode-alpha (fbo &optional attachment-name)
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    mode-alpha))
+
+(defun+ source-rgb (fbo &optional attachment-name)
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    source-rgb))
+
+(defun+ source-alpha (fbo &optional attachment-name)
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    source-alpha))
+
+(defun+ destination-rgb (fbo &optional attachment-name)
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    destination-rgb))
+
+(defun+ destination-alpha (fbo &optional attachment-name)
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    destination-alpha))
+
+(define-context-func per-attachment-blending-available-p () boolean
+    (gl-version-float)
+  (>= gl-version-float 4f0))
+
+(defn-inline check-version-for-per-attachment-params () (values)
+  (unless (per-attachment-blending-available-p)
+    (error "You are currently using a v~s gl context, this doesn't support per attachment blend mode settings. You will only be able to change blend params on the first attachment. You can however enable blending on any number of attachments and they will inherit their params from attachment 0"
+           (when (cepl-context)
+             (version-float
+              (cepl.context::%cepl-context-gl-context
+               (cepl-context)))))))
+
+(defun+ (setf mode-rgb) (value fbo &optional attachment-name)
+  (when attachment-name (check-version-for-per-attachment-params))
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    (setf mode-rgb value)))
+
+(defun+ (setf mode-alpha) (value fbo &optional attachment-name)
+  (when attachment-name (check-version-for-per-attachment-params))
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    (setf mode-alpha value)))
+
+(defun+ (setf source-rgb) (value fbo &optional attachment-name)
+  (when attachment-name (check-version-for-per-attachment-params))
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    (setf source-rgb value)))
+
+(defun+ (setf source-alpha) (value fbo &optional attachment-name)
+  (when attachment-name (check-version-for-per-attachment-params))
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    (setf source-alpha value)))
+
+(defun+ (setf destination-rgb) (value fbo &optional attachment-name)
+  (when attachment-name (check-version-for-per-attachment-params))
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    (setf destination-rgb value)))
+
+(defun+ (setf destination-alpha) (value fbo &optional attachment-name)
+  (when attachment-name (check-version-for-per-attachment-params))
+  (with-blending-param-slots (blending-params fbo attachment-name)
+    (setf destination-alpha value)))
+
+;;----------------------------------------------------------------------
 
 ;; We have another case to deal with. Per buffer blending params
 ;; is a >v4.0 feature, before that we could only enable for disable
@@ -66,6 +135,8 @@
 ;;- - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 ;; {TODO} ugh, a copy? why?
+;; I guess because otherwise someone could mutate the values without them
+;; being reflected in the gl state.
 (define-context-func current-blend-params () (or null blending-params)
     (default-framebuffer current-blend-params)
   (copy-blending-params
@@ -84,16 +155,16 @@
         (progn
           ;; We cant, at compile time, tell which attachments will be used so
           ;; loop through the attachment list and set everything up
-          `(let ((per-attachment-blendingp
-                  (per-attachment-blending-available-p)))
-             ;; if we dont support per attachemnt blend params then we use the
-             ;; params from the fbo
-             (when (not per-attachment-blendingp) (%blend-fbo ,fbo))
-             ;; enable all the attachment that have requested blending
-             (loop-enabling-attachments ,fbo)
-             ;; if we support per attachment blending then we go set their params
-             (when per-attachment-blendingp
-               (%loop-setting-per-attachment-blend-params ,fbo))))
+          (let ((per-attachment-blendingp
+                 (per-attachment-blending-available-p)))
+            ;; if we dont support per attachemnt blend params then we use the
+            ;; params from the fbo
+            (when (not per-attachment-blendingp) (%blend-fbo fbo))
+            ;; enable all the attachment that have requested blending
+            (loop-enabling-attachments fbo)
+            ;; if we support per attachment blending then we go set their params
+            (when per-attachment-blendingp
+              (%loop-setting-per-attachment-blend-params fbo))))
         ;; go disable all the attachments that were enabled
         (loop-disabling-attachments fbo))
     (setf current-blend-params params))
@@ -107,9 +178,9 @@
   ;; The user wants blending to be set by a blending params struct
   (if params
       (progn
-        (%gl:enable :blend)
+        (%gl:enable #.(gl-enum :blend))
         (%blend-using-params params))
-      (%gl:disable :blend))
+      (%gl:disable #.(gl-enum :blend)))
   (setf current-blend-params params)
   (values))
 
@@ -171,26 +242,26 @@
                ,@(loop :for b :in blendp-syms :for o :in override-syms
                     :for i :from 0 :collect
                     `(when ,b
-                       (%gl:enable-i :blend ,i)
+                       (%gl:enable-i #.(gl-enum :blend) ,i)
                        (if ,o
                            (%blend-i ,o ,i)
                            (%blend-i (blending-params ,fbo) ,i)))))
              (progn
                ,@(loop :for b :in blendp-syms :for i :from 0 :collect
-                    `(when ,b (%gl:enable-i :blend ,i))))))
+                    `(when ,b (%gl:enable-i #.(gl-enum :blend) ,i))))))
        ;; The meat
        ,@body
        ;; go disable all the attachments that were enabled
        ,@(loop :for b :in blendp-syms :for i :from 0 :collect
-            `(when ,b (%gl:disable-i :blend ,i))))))
+            `(when ,b (%gl:disable-i #.(gl-enum :blend) ,i))))))
 
 (defun+ loop-enabling-attachments (fbo)
   (loop :for a :across (%fbo-color-arrays fbo) :for i :from 0 :do
-     (when (att-blend a) (%gl:enable-i :blend i))))
+     (when (att-blend a) (%gl:enable-i #.(gl-enum :blend) i))))
 
 (defun+ loop-disabling-attachments (fbo)
   (loop :for a :across (%fbo-color-arrays fbo) :for i :from 0 :do
-     (when (att-blend a) (%gl:disable-i :blend i))))
+     (when (att-blend a) (%gl:disable-i #.(gl-enum :blend) i))))
 
 (defun+ %loop-setting-per-attachment-blend-params (fbo)
   (loop :for a :across (%fbo-color-arrays fbo) :for i :from 0 :do
@@ -201,85 +272,27 @@
 
 (defun+ %blend-i (params i)
   (with-blending-param-slots params
-    (%gl:blend-equation-separate-i i mode-rgb mode-alpha)
-    (%gl:blend-func-separate-i
-     i source-rgb destination-rgb source-alpha destination-alpha)))
+    (%gl:blend-equation-separate-i i
+                                   (gl-enum mode-rgb)
+                                   (gl-enum mode-alpha))
+    (%gl:blend-func-separate-i i
+                               (gl-enum source-rgb)
+                               (gl-enum destination-rgb)
+                               (gl-enum source-alpha)
+                               (gl-enum destination-alpha))))
 
 (defun+ %blend-fbo (fbo)
   (%blend-using-params (%fbo-blending-params fbo)))
 
 (defun+ %blend-using-params (params)
-  (%gl:blend-equation-separate (blending-params-mode-rgb params)
-                               (blending-params-mode-alpha params))
-  (%gl:blend-func-separate (blending-params-source-rgb params)
-                           (blending-params-destination-rgb params)
-                           (blending-params-source-alpha params)
-                           (blending-params-destination-alpha params)))
-
-
-;;----------------------------------------------------------------------
-
-(defun+ mode-rgb (fbo &optional attachment-name)
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    mode-rgb))
-
-(defun+ mode-alpha (fbo &optional attachment-name)
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    mode-alpha))
-
-(defun+ source-rgb (fbo &optional attachment-name)
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    source-rgb))
-
-(defun+ source-alpha (fbo &optional attachment-name)
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    source-alpha))
-
-(defun+ destination-rgb (fbo &optional attachment-name)
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    destination-rgb))
-
-(defun+ destination-alpha (fbo &optional attachment-name)
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    destination-alpha))
-
-(define-context-func per-attachment-blending-available-p () boolean
-    (gl-version-float)
-  (>= gl-version-float 4f0))
-
-(defn-inline check-version-for-per-attachment-params () (values)
-  (unless (per-attachment-blending-available-p)
-    (error "You are currently using a v~s gl context, this doesn't support per attachment blend mode settings. You will only be able to change blend params on the first attachment. You can however enable blending on any number of attachments and they will inherit their params from attachment 0" (version-float *gl-context*))))
-
-(defun+ (setf mode-rgb) (value fbo &optional attachment-name)
-  (when attachment-name (check-version-for-per-attachment-params))
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    (setf mode-rgb value)))
-
-(defun+ (setf mode-alpha) (value fbo &optional attachment-name)
-  (when attachment-name (check-version-for-per-attachment-params))
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    (setf mode-alpha value)))
-
-(defun+ (setf source-rgb) (value fbo &optional attachment-name)
-  (when attachment-name (check-version-for-per-attachment-params))
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    (setf source-rgb value)))
-
-(defun+ (setf source-alpha) (value fbo &optional attachment-name)
-  (when attachment-name (check-version-for-per-attachment-params))
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    (setf source-alpha value)))
-
-(defun+ (setf destination-rgb) (value fbo &optional attachment-name)
-  (when attachment-name (check-version-for-per-attachment-params))
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    (setf destination-rgb value)))
-
-(defun+ (setf destination-alpha) (value fbo &optional attachment-name)
-  (when attachment-name (check-version-for-per-attachment-params))
-  (with-blending-param-slots (blending-params fbo attachment-name)
-    (setf destination-alpha value)))
+  (%gl:blend-equation-separate
+   (gl-enum (blending-params-mode-rgb params))
+   (gl-enum (blending-params-mode-alpha params)))
+  (%gl:blend-func-separate
+   (gl-enum (blending-params-source-rgb params))
+   (gl-enum (blending-params-destination-rgb params))
+   (gl-enum (blending-params-source-alpha params))
+   (gl-enum (blending-params-destination-alpha params))))
 
 
 ;;----------------------------------------------------------------------
@@ -289,6 +302,8 @@
 ;; these (or if I should). I like the idea of cpu side debugging using this
 ;; but in issolation it doesnt really mean much. Probably only makes sense in
 ;; a software renderer.
+
+;; (defvar *blend-color* (v! 0 0 0 0))
 
 ;; (defun zero
 ;;     (source destination &key (target-rgb t) (blend-color *blend-color*))

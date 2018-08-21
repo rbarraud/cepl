@@ -25,7 +25,7 @@
   (values))
 
 (defn-inline uniform-2i ((location (signed-byte 32))
-                         (value rtg-math.types:ivec2))
+                         (value ivec2))
     (values)
   (declare (optimize (speed 3) (safety 1) (debug 0)
                      (compilation-speed 0))
@@ -36,7 +36,7 @@
   (values))
 
 (defn-inline uniform-3i ((location (signed-byte 32))
-                         (value rtg-math.types:ivec3))
+                         (value ivec3))
     (values)
   (declare (optimize (speed 3) (safety 1) (debug 0)
                      (compilation-speed 0))
@@ -47,7 +47,7 @@
   (values))
 
 (defn-inline uniform-4i ((location (signed-byte 32))
-                         (value rtg-math.types:ivec4))
+                         (value ivec4))
     (values)
   (declare (optimize (speed 3) (safety 1) (debug 0)
                      (compilation-speed 0))
@@ -69,7 +69,7 @@
   (values))
 
 (defn-inline uniform-2f ((location (signed-byte 32))
-                         (value rtg-math.types:vec2))
+                         (value vec2))
     (values)
   (declare (optimize (speed 3) (safety 1) (debug 0)
                      (compilation-speed 0))
@@ -80,7 +80,7 @@
   (values))
 
 (defn-inline uniform-3f ((location (signed-byte 32))
-                         (value rtg-math.types:vec3))
+                         (value vec3))
     (values)
   (declare (optimize (speed 3) (safety 1) (debug 0)
                      (compilation-speed 0))
@@ -91,7 +91,7 @@
   (values))
 
 (defn-inline uniform-4f ((location (signed-byte 32))
-                         (value rtg-math.types:vec4))
+                         (value vec4))
     (values)
   (declare (optimize (speed 3) (safety 1) (debug 0)
                      (compilation-speed 0))
@@ -113,7 +113,7 @@
   (values))
 
 (defn-inline uniform-matrix-3ft ((location (signed-byte 32))
-                                 (value rtg-math.types:mat3))
+                                 (value mat3))
     (values)
   (declare (optimize (speed 3) (safety 1) (debug 0)
                      (compilation-speed 0))
@@ -124,7 +124,7 @@
   (values))
 
 (defn-inline uniform-matrix-4ft ((location (signed-byte 32))
-                                 (value rtg-math.types:mat4))
+                                 (value mat4))
     (values)
   (declare (optimize (speed 3) (safety 1) (debug 0)
                      (compilation-speed 0))
@@ -173,7 +173,7 @@
   "Used when uploading from a foreign data source (like a c-array)
    This lets your uploading from an offset the source"
   (case type
-    ((:int :int-arb :bool :bool-arb) '%gl:uniform-1iv)
+    ((:int :int32 :int-arb :bool :bool-arb) '%gl:uniform-1iv)
     ((:float :float-arb) '%gl:uniform-1fv)
     ((:int-vec2 :int-vec2-arb :bool-vec2 :bool-vec2-arb) '%gl:uniform-2iv)
     ((:int-vec3 :int-vec3-arb :bool-vec3 :bool-vec3-arb) '%gl:uniform-3iv)
@@ -185,12 +185,13 @@
     ((:mat3 :float-mat3 :float-mat3-arb) 'uniform-matrix-3fvt)
     ((:mat4 :float-mat4 :float-mat4-arb) 'uniform-matrix-4fvt)
     (t (if (cepl.samplers::sampler-typep (type-spec->type type)) nil
-           (error "Sorry cepl doesnt handle that type yet")))))
+           (error "Sorry cepl doesnt handle that type yet: ~a"
+                  type)))))
 
 (defun+ get-uniform-function-name (type)
   "Used when uploading lisp data"
   (case type
-    ((:int :int-arb :bool :bool-arb) 'uniform-1i)
+    ((:int :int32 :int-arb :bool :bool-arb) 'uniform-1i)
     ((:float :float-arb) 'uniform-1f)
     ((:int-vec2 :int-vec2-arb :bool-vec2 :bool-vec2-arb) 'uniform-2i)
     ((:int-vec3 :int-vec3-arb :bool-vec3 :bool-vec3-arb) 'uniform-3i)
@@ -202,4 +203,5 @@
     ((:mat3 :float-mat3 :float-mat3-arb) 'uniform-matrix-3ft)
     ((:mat4 :float-mat4 :float-mat4-arb) 'uniform-matrix-4ft)
     (t (if (cepl.samplers::sampler-typep (type-spec->type type)) 'uniform-sampler
-           (error "Sorry cepl doesnt handle that type yet")))))
+           (error "Sorry cepl doesnt handle that type yet: ~a"
+                  type)))))

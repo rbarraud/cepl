@@ -1,5 +1,4 @@
 (in-package :cepl.pipelines)
-(in-readtable fn:fn-reader)
 
 ;; extract details from args and delegate to %def-gpu-function
 ;; for the main logic
@@ -16,17 +15,20 @@
   ;; at the tail
   ;; -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
   ;; seperate any doc-string or declarations from the body
-  (let ((doc-string (when (stringp (first body)) (pop body))))
+  (multiple-value-bind (code decls doc-string)
+      (varjo.internals::extract-declares-and-doc-string
+       body `(define-vari-function ,name ,args ,@body))
+    (declare (ignore code decls))
     ;; split the argument list into the categoried we care aboutn
-    (assoc-bind ((in-args nil) (uniforms :&uniform) (context :&context)
-                 (instancing :&instancing))
-        (varjo.utils:lambda-list-split '(:&uniform :&context :&instancing) args)
+    (assoc-bind ((in-args nil) (uniforms :&uniform) (raw-context :&context)
+                 (shared :&shared))
+        (varjo.utils:lambda-list-split '(:&uniform :&context :&shared) args)
       ;; check the arguments are sanely formatted
       (mapcar #'(lambda (x) (assert-arg-format name x)) in-args)
       (mapcar #'(lambda (x) (assert-arg-format name x)) uniforms)
       ;; now the meat
-      (%def-gpu-function name in-args uniforms body instancing
-                         doc-string equiv context))))
+      (%def-gpu-function name in-args uniforms body shared
+                         doc-string equiv raw-context))))
 
 (defun+ assert-arg-format (gfunc-name x)
   (unless (listp x)
@@ -35,8 +37,8 @@
 
 ;;--------------------------------------------------
 
-(defun+ %def-gpu-function (name in-args uniforms body instancing
-                          doc-string equiv context)
+(defun+ %def-gpu-function (name in-args uniforms body shared
+                          doc-string equiv raw-context)
   "This is the meat of defun-g. it is broken down as follows:
 
    [0] makes a gpu-func-spec that will be populated a stored later.
@@ -44,7 +46,7 @@
    [1] Adds a external function definition to varjo also make sure it will be
        called on load
 
-   [2] %test-&-update-spec compiles the code to check for errors and log
+   [2] %test-&-process-spec compiles the code to check for errors and log
        dependencies. (this is called at runtime)
 
    [3] %make-gpu-func-spec is called at expand time to write a lisp function
@@ -61,13 +63,20 @@
        first too all affected pipelines.
 
    [5] At runtime this looks for any gpu function that listed this function as
-       one of its missing dependencies and calls %test-&-update-spec on them.
+       one of its missing dependencies and calls %test-&-process-spec on them.
        Note that this will (possibly) update the spec but will not trigger a
        recompile in the pipelines."
-  (let ((spec (%make-gpu-func-spec name in-args uniforms context body instancing
-                                   nil nil nil doc-string nil
-                                   nil));;[0]
-        (valid-glsl-versions (get-versions-from-context context)))
+  (let* ((compile-context (parse-compile-context name raw-context :function))
+         (spec (%make-gpu-func-spec name in-args uniforms compile-context
+                                    body shared nil nil uniforms doc-string
+                                    nil nil (get-gpu-func-spec-tag))) ;;[0]
+         (valid-glsl-versions (compile-context-versions compile-context))
+         (spec-key (spec->func-key spec))
+         (old-spec (gpu-func-spec spec-key nil))
+         (changedp (spec-changed-p spec old-spec))
+         (spec (if changedp
+                   spec
+                   old-spec)))
     ;; this gets the functions used in the body of this function
     ;; it is *not* recursive
     (%update-gpu-function-data spec nil nil)
@@ -76,36 +85,24 @@
     `(progn
        (varjo:add-external-function ',name ',in-args ',uniforms ',body
                                     ',valid-glsl-versions);;[1]
-       (%test-&-update-spec ,spec);;[2]
        ,(unless equiv (make-stand-in-lisp-func spec));;[3]
-       (%recompile-gpu-function-and-pipelines ,(spec->func-key spec));;[4]
+       (%test-&-process-spec ,spec);;[2]
+       ,(when changedp
+          `(%recompile-gpu-function-and-pipelines ,spec-key));;[4]
        (update-specs-with-missing-dependencies);;[5]
        ',name)))
 
-(defun+ get-versions-from-context (context)
-  (%sort-versions
-   (remove-if-not λ(member _ varjo:*supported-versions*)
-                  context)))
 
-(defun+ %sort-versions (versions)
-  (mapcar #'first
-          (sort (mapcar λ(list _ (parse-integer (symbol-name _)))
-                        versions)
-                #'< :key #'second)))
 
-(defun+ swap-version (glsl-version context)
-  (cons glsl-version (remove-if λ(find _ varjo:*supported-versions*) context)))
-
-(defun+ lowest-suitable-glsl-version (context)
-  (let* ((versions (or (get-versions-from-context context)
-                       (list (cepl.context::get-best-glsl-version)))))
+(defun+ lowest-suitable-glsl-version (compile-context)
+  (let* ((versions (compile-context-versions compile-context)))
     (case= (length versions)
-      (0 (cepl.context::get-best-glsl-version))
+      (0 (cepl.context::get-best-glsl-version versions))
       (otherwise (first versions)))))
 
 (defvar *warn-when-cant-test-compile* t)
 
-(defun+ %test-&-update-spec (spec)
+(defun+ %test-&-process-spec (spec &key (cache-spec t))
   "Use varjo to compile the code.
    [0] If the compilation throws a could-not-find-function error, then record
    that missing function's name as a missing dependency.
@@ -117,40 +114,45 @@
    [2] We also record the uniforms in the compiled result. The uniforms in the
    definition are the public interface, but the compiler may have removed or
    modified the uniforms. To this end we store the final uniforms and the forms
-   that transform between the public uniform arguments and the internal ones."
+   that transform between the public uniform arguments and the internal ones.
+
+   [3] We call 'add-layout-to-struct-uniforms' here to ensure that the ubo/ssbo
+   arguments have the correct layout information. This is not important for
+   the test compilation, but instead for the uniform information that is
+   gathered from this test compile (actual-uniforms)."
   (with-gpu-func-spec spec
     (handler-case
         (varjo:with-constant-inject-hook #'try-injecting-a-constant
           (varjo:with-stemcell-infer-hook #'try-guessing-a-varjo-type-for-symbol
-            (handler-bind
-                ((varjo-conditions:cannot-establish-exact-function
-                  (lambda (c)
-                    (declare (ignore c))
-                    (invoke-restart
-                     'varjo-conditions:allow-call-function-signature))))
-              (let* ((context (swap-version (lowest-suitable-glsl-version context)
-                                            context))
+            (varjo:with-unknown-first-class-functions-allowed
+              (let* ((varjo.internals::*allow-call-function-signature* t)
+                     (versions (list (lowest-suitable-glsl-version context)))
+                     (uniforms (add-layout-to-struct-uniforms name
+                                                              :function
+                                                              uniforms));;[3]
                      (compiled
                       (first
                        (varjo.internals::test-translate-function-split-details
-                        name in-args uniforms context body varjo:*stage-names* t))))
+                        name in-args uniforms versions body varjo:*stage-names* t))))
                 (setf actual-uniforms ;;[2]
                       (mapcar #'varjo.internals:to-arg-form
                               (remove-if #'varjo:ephemeral-p
                                          (varjo.api:uniform-variables compiled))))
 
-                (%update-gpu-function-data
-                 spec
-                 (remove-if-not #'gpu-func-spec
-                                (varjo:used-external-functions compiled)) ;;[1]
-                 compiled)))))
+                (when cache-spec
+                  (%update-gpu-function-data
+                   spec
+                   (remove-if-not #'gpu-func-spec
+                                  (varjo:used-external-functions compiled)) ;;[1]
+                   compiled))))))
       ;; vv- called if failed
       (varjo-conditions:could-not-find-function (e) ;;[0]
         (setf missing-dependencies (list (slot-value e 'varjo.internals:name)))
         (when *warn-when-cant-test-compile*
           (format t "~% cepl: the function ~s was not found when compiling ~s"
                   (first missing-dependencies) name))
-        (%update-gpu-function-data spec nil nil)))
+        (when cache-spec
+          (%update-gpu-function-data spec nil nil))))
     spec))
 
 
@@ -171,6 +173,9 @@
   ;; recompile gpu-funcs that depends on name
   (mapcar #'%recompile-gpu-function-and-pipelines
           (funcs-that-use-this-func key));;[0]
+  ;; update diff-tag
+  (with-gpu-func-spec (gpu-func-spec key)
+    (setf diff-tag (get-gpu-func-spec-tag)))
   ;; and recompile pipelines that depend on name
   (recompile-pipelines-that-use-this-as-a-stage key))
 
@@ -182,8 +187,8 @@
    [2] cache the compile result so we can retrieve it with #'pull1-g
        or the code with #'pull-g"
   (%unsubscibe-from-all spec);;[1]
-  (map nil λ(%subscribe-to-gpu-func spec _) depends-on);;[1]
-  (when +cache-last-compile-result+
+  (map nil (lambda (x) (%subscribe-to-gpu-func spec x)) depends-on) ;;[1]
+  (when *cache-last-compile-result*
     (setf (slot-value spec 'cached-compile-results) compiled));;[2]
   (setf (gpu-func-spec spec) spec));;[0]
 
@@ -195,7 +200,7 @@
 
 (defmethod %subscribe-to-gpu-func (func subscribe-to)
   "As the name would suggest this makes one function dependent on another
-   It is used by #'%test-&-update-spec via #'%update-gpu-function-data "
+   It is used by #'%test-&-process-spec via #'%update-gpu-function-data "
   (let ((func (func-key func))
         (subscribe-to (func-key subscribe-to)))
     (assert (not (func-key= func subscribe-to)))
@@ -218,72 +223,81 @@
   This means we get function arg hints, doc-string and also we have the
   opportunity to provide a cpu implementation one day we want to."
   (with-gpu-func-spec spec
-    (let ((arg-names (mapcar #'first in-args))
-          (uniform-names (mapcar #'first uniforms)))
-      `(setf (symbol-function ',name)
-             (lambda (,@arg-names
-                      ,@(when uniforms (cons (symb :&key) uniform-names)))
-               ,@(when doc-string (list doc-string))
-               (declare (ignore ,@arg-names ,@uniform-names))
-               (warn "GPU Functions cannot currently be used from the cpu"))))))
+    `(setf (symbol-function ',name)
+           (lambda (&rest args)
+             ,@(when doc-string (list doc-string))
+             (apply #'funcall-g ',name args)))))
 
 ;;--------------------------------------------------
 
-(defun+ %aggregate-uniforms (uniforms &optional accum)
-  "The meat behind the uniform aggregation functions
-   The reason we need to aggregate uniforms is as follows:
+(defun+ aggregate-uniforms (name
+                            target-kind
+                            func-specs
+                            &optional actual-uniforms-p)
+  "The reason we need to aggregate uniforms is as follows:
    - pipelines are made of composed gpu functions
    - each gpu function may introduce uniforms
    - to this end we need to make sure the different functions' uniforms are
      compatible and then return a final list of aggregated uniforms.
 
-   The criteria for a uniform being valid is that:
-   [0] there is no other uniform with matching name, hense no collision
-   [1] the uniform matches perfectly so no collision
-   [2] otherwise it's a clash"
-  (if uniforms
-      (let ((u (first uniforms)))
-        (cond
-          ;;[0]
-          ((not (find (first u) accum :test #'equal :key #'first))
-           (%aggregate-uniforms (rest uniforms) (cons u accum)))
-          ;;[1]
-          ((find u accum :test #'equal)
-           (%aggregate-uniforms (rest uniforms) accum))
-          ;;[2]
-          (t (error "Uniforms for the functions are incompatible: ~a ~a"
-                    u accum))))
-      accum))
+   The way we do this is:
+   [0] Remove all duplicates, this handles all cases where the same uniform is
+       in different gpu-functions
+   [1] Now if there is any more than one instance of each uniform name then
+       there is a clash
 
-(defun+ aggregate-uniforms (keys &optional accum interal-uniforms-p)
-  "[0] Aggregates the uniforms from the named gpu-functions,
-
-   The reason we need to aggregate uniforms is as follows:
-   - pipelines are made of composed gpu functions
-   - each gpu function may introduce uniforms
-   - to this end we need to make sure the different functions' uniforms are
-     compatible and then return a final list of aggregated uniforms."
-  (if keys
-      (aggregate-uniforms
-       (rest keys)
-       (%aggregate-uniforms;;[0]
-        (with-gpu-func-spec (gpu-func-spec (first keys))
-          (if interal-uniforms-p
-              actual-uniforms
-              uniforms))
-        accum)
-       interal-uniforms-p)
-      accum))
+   Sidenote:
+   [X] We call 'add-layout-to-struct-uniforms' here to ensure that the ubo/ssbo
+       arguments have the correct layout information. This is not important for
+       the test compilation, but instead for the uniform information that is
+       gathered from this test compile (actual-uniforms)."
+  (assert (every (lambda (x) (typep x 'gpu-func-spec))
+                 func-specs))
+  (labels ((get-uniforms (spec)
+             (add-layout-to-struct-uniforms
+              name
+              target-kind
+              (with-gpu-func-spec spec
+                (copy-list
+                 (if actual-uniforms-p
+                     actual-uniforms
+                     uniforms)))))
+           (normalize-type-names (uniform)
+             (dbind (name type &rest rest) uniform
+               (let ((type (varjo:type->type-spec
+                            (varjo:type-spec->type
+                             type))))
+                 `(,name ,type ,@rest)))))
+    ;;
+    (let* ((uniforms (mapcan #'get-uniforms func-specs))
+           (uniforms (mapcar #'normalize-type-names uniforms))
+           (uniforms (remove-duplicates uniforms :test #'equal)) ;; [0]
+           (all-clashes
+            (loop :for uniform :in uniforms :collect
+               (let* ((name (first uniform))
+                      (clashes (remove-if-not (lambda (x) (eq name (first x)))
+                                              uniforms)))
+                 (when (> (length clashes) 1) ;; [1]
+                   (list (first uniform) clashes)))))
+           (all-clashes (remove-duplicates (remove nil all-clashes)
+                                           :key #'first)))
+      (when all-clashes
+        (error "CEPL: Uniforms found in pipeline with incompatible definitions:
+~{~%~a~}"
+               (mapcar (lambda (x)
+                         (format nil "~s:~{~%~s~}~%" (first x) (second x)))
+                       all-clashes)))
+      uniforms)))
 
 ;;--------------------------------------------------
 
-(defun+ get-func-as-stage-code (stage)
-  (with-gpu-func-spec stage
-    (list in-args uniforms context body)))
+(defun+ get-func-as-stage-code (func-spec)
+  (with-gpu-func-spec func-spec
+    (list in-args uniforms shared context body)))
 
 ;;--------------------------------------------------
 
-(defun+ %varjo-compile-as-pipeline (draw-mode parsed-gpipe-args)
+(defun+ %varjo-compile-as-pipeline (name primitive parsed-gpipe-args)
   "Compile the gpu functions for a pipeline
    The argument to this function is a list of pairs.
    Each pair contains:
@@ -292,74 +306,130 @@
   (varjo:with-constant-inject-hook #'try-injecting-a-constant
     (varjo:with-stemcell-infer-hook #'try-guessing-a-varjo-type-for-symbol
       (varjo:rolling-translate
-       (mapcar λ(parsed-gpipe-args->v-translate-args draw-mode _)
-               parsed-gpipe-args)))))
+       (loop
+          :for (stage-type . func-spec) :in parsed-gpipe-args
+          :collect (parsed-gpipe-args->v-translate-args name
+                                                        primitive
+                                                        stage-type
+                                                        func-spec))))))
+
+(defun+ add-layout-to-struct-uniforms (name target-kind uniforms)
+  (assert (member target-kind '(:pipeline :function)))
+  (flet ((add-layout-to-struct-uniform (name arg)
+           (let* ((type-spec
+                   (second arg))
+                  (struct-info
+                   (cepl.types::g-struct-info type-spec
+                                              :error-if-not-found nil)))
+             (if struct-info
+                 (let ((layout (cepl.types::s-layout struct-info)))
+                   (when layout
+                     (assert (or (find :ssbo arg) (find :ubo arg))
+                             ()
+                             'invalid-layout-for-uniform
+                             :name name
+                             :func-p (eq target-kind :function)
+                             :type-name type-spec
+                             :layout (class-name (class-of layout))))
+                   (etypecase layout
+                     (null arg)
+                     (std-140 (if (find :std-140 arg)
+                                  arg
+                                  (append arg (list :std-140))))
+                     (std-430 (if (find :std-430 arg)
+                                  arg
+                                  (append arg (list :std-430))))))
+                 arg))))
+    (mapcar (lambda (arg) (add-layout-to-struct-uniform name arg))
+            uniforms)))
 
 ;; {TODO} make the replacements related code more robust
-(defun+ parsed-gpipe-args->v-translate-args (draw-mode stage-pair
-                                            &optional replacements)
-  "%varjo-compile-as-pipeline simply takes (stage . gfunc-name) pairs from
-   %compile-link-and-upload needs to call v-rolling-translate. To do this
-   we need to look up the gpu function spec and turn them into valid arguments
-   for the rolling-translate function.
-   That is what this function does.
+(defun+ parsed-gpipe-args->v-translate-args (name
+                                             pipeline-primitive
+                                             stage-kind
+                                             func-spec
+                                             &optional replacements)
+  "parsed-gpipe-args->v-translate-args processed the (stage . gfunc-name) pairs
+   that %compile-link-and-upload want to call v-rolling-translate on.
+   To do this we need to look up the gpu function spec and turn them into valid
+   arguments for the rolling-translate function.
    It also:
-   [0] if it's a glsl-stage then it is already compiled. Pass the compile result
-       and let varjo handle it
-   [1] validate that either the gpu-function's context didnt specify a stage
-       explicitly or that, if it did, that it matches the stage it is being used
-       for now"
+   [0] if it's a glsl-stage then it is already compiled. Pass the
+       compile-result and let varjo handle it
+   [1] is what handles the transformation of func (including gpu-lambdas)
+   [2] 'replacements' specifies uniforms to replace in the stage. "
   (assert (every #'listp replacements))
-  (dbind (stage-type . stage) stage-pair
-    (if (typep (gpu-func-spec stage) 'glsl-stage-spec)
-        (with-glsl-stage-spec (gpu-func-spec stage)
-          compiled);;[0]
-        (dbind (in-args uniforms context code) (get-func-as-stage-code stage)
-          ;;[1]
-          (let ((n (count-if (lambda (_) (member _ varjo:*stage-names*))
-                             context)))
-            (assert (and (<= n 1) (if (= n 1) (member stage-type context) t))))
-          (let* ((final-uniforms (remove-if (lambda (u)
-                                              (member (first u) replacements
-                                                      :key #'first
-                                                      :test #'string=))
-                                            uniforms))
-                 (context (remove stage-type context))
-                 (primitive (when (eq stage-type :vertex)
-                              draw-mode))
-                 (replacements
-                  (loop :for (k v) :in replacements
-                     :for r = (let* ((u (find k uniforms :key #'first
-                                              :test #'string=)))
-                                (when (and u (typep (varjo:type-spec->type
-                                                     (second u))
-                                                    'varjo:v-function-type))
-                                  (list (first u) `(function ,v))))
-                     :when r :collect r))
-                 (body (if replacements
-                           `((let ,replacements
-                               ,@code))
-                           code)))
-            (varjo:make-stage stage-type
-                              in-args
-                              final-uniforms
-                              context
-                              body
-                              t
-                              primitive))))))
+  (if (typep func-spec 'glsl-stage-spec)
+      (with-glsl-stage-spec func-spec
+        compiled);;[0]
+      (dbind (in-args uniforms shared compile-context code)
+          (get-func-as-stage-code func-spec) ;;[1]
+        (loop :for arg :in in-args :do
+           (let* ((type-spec (second arg))
+                  (struct-info
+                   (cepl.types::g-struct-info type-spec
+                                              :error-if-not-found nil)))
+             (when struct-info
+               (let ((layout (cepl.types::s-layout struct-info)))
+                 (assert (null layout) ()
+                         'invalid-layout-for-inargs
+                         :name name
+                         :type-name type-spec
+                         :layout (class-name (class-of layout)))))))
+        (let* ((uniforms (add-layout-to-struct-uniforms name
+                                                        :pipeline
+                                                        uniforms))
+               (final-uniforms (remove-if (lambda (u)
+                                            (member (first u) replacements
+                                                    :key #'first
+                                                    :test #'string=))
+                                          uniforms))
+               (replacements ;; [2]
+                (loop :for (k v) :in replacements
+                   :for r = (let* ((u (find k uniforms :key #'first
+                                            :test #'string=)))
+                              (when (and u (typep (varjo:type-spec->type
+                                                   (second u))
+                                                  'varjo:v-function-type))
+                                (list (first u) `(the ,(second u)
+                                                      (function ,v)))))
+                   :when r :collect r))
+               (body (if replacements
+                         `((let ,replacements
+                             ,@code))
+                         code))
+               (versions (compile-context-versions compile-context))
+               (func-stage (compile-context-stage compile-context)))
+          (when func-stage
+            (assert (eq stage-kind func-stage) ()
+                    'stage-not-valid-for-function-restriction
+                    :name name
+                    :stage stage-kind
+                    :func-stage func-stage))
+          ;; {TODO} we need to use the function's primitive
+          (varjo:create-stage stage-kind
+                              versions
+                              :input-variables in-args
+                              :uniform-variables final-uniforms
+                              :shared-variables shared
+                              :code body
+                              :stemcells-allowed t
+                              :primitive (when (eq stage-kind :vertex)
+                                           pipeline-primitive))))))
 
 ;;--------------------------------------------------
 
 (defun+ get-possible-designators-for-name (name)
-  (mapcar λ(with-gpu-func-spec _
-             (cons name (mapcar #'second in-args)))
+  (mapcar (lambda (x)
+            (with-gpu-func-spec x
+              (cons name (mapcar #'second in-args))))
           (gpu-func-specs name)))
 
 (defun+ get-stage-key (stage-designator &optional options-on-error)
   (cond
     ((and (listp stage-designator) (eq (first stage-designator) 'function))
      (get-stage-key (second stage-designator)))
-    ((typep stage-designator 'gpu-lambda)
+    ((functionp stage-designator)
      (lambda-g->func-spec stage-designator))
     ((symbolp stage-designator)
      (let* ((name stage-designator)
@@ -368,13 +438,15 @@
          (error 'stage-not-found :designator name)
          (error 'gpu-func-symbol-name
                 :name stage-designator
-                :alternatives (mapcar λ(with-gpu-func-spec _
-                                         (cons stage-designator
-                                               (mapcar #'second in-args)))
+                :alternatives (mapcar (lambda (x)
+                                        (with-gpu-func-spec x
+                                          (cons stage-designator
+                                                (mapcar #'second in-args))))
                                       funcs)
                 :env options-on-error))))
     ((listp stage-designator)
-     (let ((key (new-func-key (first stage-designator) (rest stage-designator))))
+     (let ((key (new-func-key (first stage-designator)
+                              (rest stage-designator))))
        (if (gpu-func-spec key)
            key
            (error 'stage-not-found :designator stage-designator))))
@@ -392,11 +464,19 @@
    stage pairs are of the form (stage-name . gpu-function-name)"
   (let ((cut-pos (or (position :post args) (length args))))
     (destructuring-bind (&key post) (subseq args cut-pos)
-      (let ((args (subseq args 0 cut-pos)))
+      (let* ((args (subseq args 0 cut-pos))
+             (len (length args)))
         (list
-         (if (and (= (length args) 2) (not (some #'keywordp args)))
-             (parse-gpipe-args-implicit args)
-             (parse-gpipe-args-explicit args))
+         (pairs-key-to-stage
+          (cond
+            ((and (= len 2) (not (some #'keywordp args)))
+             (parse-gpipe-args-implicit args))
+            ((= len 1) (error 'one-stage-non-explicit))
+            (t
+             (assert (= (count-if #'keywordp args)
+                        (floor len 2))
+                     () 'no-named-stages :stages args)
+             (parse-gpipe-args-explicit args))))
          post)))))
 
 (defun+ parse-gpipe-args-implicit (args)
@@ -404,24 +484,59 @@
     (list (cons :vertex v-key)
           (cons :fragment f-key))))
 
+(defun complete-single-stage-pipeline (stage)
+  (case (first stage)
+    (:fragment
+     (list (cons :vertex (get-stage-key '(cepl.pipelines::stateless-quad-vertex-stage)))
+           (cons :geometry (get-stage-key '(cepl.pipelines::stateless-quad-geometry-stage)))
+           stage))
+    (:vertex
+     (list stage))
+    (:compute
+     (list stage))
+    (otherwise (error 'invalid-stage-for-single-stage-pipeline))))
+
+(defun massage-compute-stage-name (name)
+  ;; we allow a little massaging here as compute stages have no in-args so
+  ;; there can be no overloading. In these cases it feels bit mean to be
+  ;; as harsh on signature
+  (cond
+    ((symbolp name) (list name))
+    ((and (listp name)
+          (eq (first name) 'function)
+          (symbolp (second name))
+          (second name))
+     `(function (,(second name))))
+    (t name)))
+
 (defun+ parse-gpipe-args-explicit (args)
   (dbind (&key vertex tessellation-control tessellation-evaluation
-               geometry fragment) args
-    (dbind (v-key tc-key te-key g-key f-key)
-        (validate-stage-names (list vertex tessellation-control
-                                    tessellation-evaluation
-                                    geometry fragment))
-      (remove nil
-              (list (when vertex
-                      (cons :vertex v-key))
-                    (when tessellation-control
-                      (cons :tessellation-control tc-key))
-                    (when tessellation-evaluation
-                      (cons :tessellation-evaluation te-key))
-                    (when geometry
-                      (cons :geometry g-key))
-                    (when fragment
-                      (cons :fragment f-key)))))))
+               geometry fragment compute) args
+    (let ((compute (when compute
+                     (massage-compute-stage-name compute))))
+      (dbind (v-key tc-key te-key g-key f-key c-key)
+          (validate-stage-names (list vertex tessellation-control
+                                      tessellation-evaluation
+                                      geometry fragment compute))
+        (let ((result
+               (remove nil
+                       (list (when vertex
+                               (cons :vertex v-key))
+                             (when tessellation-control
+                               (cons :tessellation-control tc-key))
+                             (when tessellation-evaluation
+                               (cons :tessellation-evaluation te-key))
+                             (when geometry
+                               (cons :geometry g-key))
+                             (when fragment
+                               (cons :fragment f-key))
+                             (when compute
+                               (cons :compute c-key))))))
+          ;;
+          ;; single fragment pipeline
+          (if (= 1 (length result))
+              (complete-single-stage-pipeline (first result))
+              result))))))
 
 (defun+ validate-stage-names (names)
   (let* (invalid
@@ -540,8 +655,7 @@
            (spec (gpu-func-spec func-key nil)))
       (if spec
           (progn
-            (setf *gpu-func-specs* (remove func-key *gpu-func-specs*
-                                           :test #'func-key= :key #'car))
+            (delete-func-spec func-key)
             (varjo:delete-external-function name in-arg-types))
           (when error-if-missing
             (error 'gpu-func-spec-not-found

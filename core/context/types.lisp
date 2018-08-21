@@ -12,18 +12,50 @@
    (hidden :initarg :hidden)
    (legacy-gl-version :initarg :legacy-gl-version)))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defconstant +max-context-count+ 8))
+
+(deftype context-id ()
+  `(integer -1 ,+max-context-count+))
+
+(defvar *free-context-ids-lock* (bt:make-lock))
+
+(defvar *free-context-ids*
+  (loop :for i :below +max-context-count+ :collect i))
+
+(defun get-free-context-id ()
+  (bt:with-lock-held (*free-context-ids-lock*)
+    (or (pop *free-context-ids*)
+        (error 'max-context-count-reached
+               :max +max-context-count+))))
+
+(defun discard-context-id (id)
+  (bt:with-lock-held (*free-context-ids-lock*)
+    (push id *free-context-ids*)))
+
+(defstruct unbound-cepl-context
+  (consumed nil :type boolean)
+  (gl-context nil :type gl-context)
+  (requested-gl-version nil :type t)
+  (shared nil :type cepl-context)
+  (surface nil :type t)
+  (surfaces nil :type list))
+
 (defstruct (cepl-context (:constructor %make-cepl-context)
                          (:conc-name %cepl-context-))
+  (id (error "Context missing an ID") :type context-id)
   (gl-context nil :type (or null gl-context))
   (requested-gl-version nil :type t)
   (gl-version-float 0f0 :type single-float)
-  (gl-thread nil :type (or null bt:thread))
+  (bound-thread nil :type (or null bt:thread))
   (uninitialized-resources nil :type list)
-  (shared (error "Context must be in-package via #'make-context")
-          :type (array cepl-context (*)))e
+  (shared (error "Context must be initialized via #'make-context")
+          :type (array cepl-context (*)))
   (surfaces
    (error "Context must be initialized via #'make-context")
    :type list)
+  (current-program +unknown-gl-id+ :type gl-id)
+  (current-tfs nil :type (or null transform-feedback-stream))
   (current-surface nil :type t)
   (vao-binding-id +unknown-gl-id+ :type vao-id)
   (current-viewport nil :type (or null viewport))
@@ -54,6 +86,18 @@
    (make-array 0 :element-type 'gl-id :initial-element +null-gl-id+
                :adjustable t :fill-pointer 0)
    :type (array gl-id (*)))
+  (array-of-ubo-binding-ranges
+   (make-array 0 :element-type '(unsigned-byte 32)
+               :initial-element 0 :adjustable t :fill-pointer 0)
+   :type (array (unsigned-byte 32) (*)))
+  (array-of-ssbo-bindings-buffer-ids
+   (make-array 0 :element-type 'gl-id :initial-element +null-gl-id+
+               :adjustable t :fill-pointer 0)
+   :type (array gl-id (*)))
+  (array-of-ssbo-binding-ranges
+   (make-array 0 :element-type '(unsigned-byte 32)
+               :initial-element 0 :adjustable t :fill-pointer 0)
+   :type (array (unsigned-byte 32) (*)))
   (array-of-transform-feedback-bindings-buffer-ids
    (make-array 0 :element-type 'gl-id :initial-element +null-gl-id+
                :adjustable t :fill-pointer 0)
@@ -63,41 +107,49 @@
    (make-array 0 :element-type '(or null sampler) :initial-element nil)
    :type (simple-array (or null sampler) (*)))
 
+  (array-of-bound-queries
+   (make-array 7 :element-type '(or null gpu-query) :initial-element nil)
+   :type (simple-array (or null gpu-query) (7)))
+
   (array-of-textures
    (make-array 0 :element-type 'texture :initial-element +null-texture+
                :adjustable t :fill-pointer 0)
    :type (array texture (*)))
-  (map-of-pipeline-names-to-gl-ids
-   (make-hash-table :test #'eq)
-   :type hash-table)
   (depth-func :unknown :type (or symbol function))
   (depth-mask nil :type boolean)
   (color-masks (make-array 0 :element-type '(simple-array boolean (4)))
                :type (simple-array (simple-array boolean (4)) (*)))
-  (depth-range (v! 0 1) :type vec2)
+  (depth-range (vec2 0f0 1f0) :type vec2)
   (depth-clamp nil :type boolean)
   (cull-face :unknown :type (or symbol function))
   (front-face :unknown :type symbol)
-  (clear-color (v! 0 0 0 0) :type vec4))
+  (clear-color (vec4 0f0 0f0 0f0 0f0) :type vec4)
+  ;;
+  (pack-alignment 4 :type (integer 1 8))
+  (unpack-alignment 4 :type (integer 1 8))
+  (max-draw-buffer-count 0 :type (unsigned-byte 16))
+  (instance-count 0 :type c-array-index))
 
 (defmethod print-object ((context cepl-context) stream)
-  (format stream "#<CEPL-CONTEXT>"))
+  (format stream "#<CEPL-CONTEXT ~a>" (slot-value context 'bound-thread)))
 
 (defmacro %with-cepl-context-slots (slots context &body body)
   (let ((context-slots
-         '(gl-context requested-gl-version gl-thread uninitialized-resources
-           shared surfaces current-surface vao-binding-id current-viewport
-           default-viewport current-scissor-viewports
-           default-framebuffer read-fbo-binding draw-fbo-binding fbos
-           array-of-bound-gpu-buffers array-of-gpu-buffers
-           array-of-ubo-bindings-buffer-ids current-blend-params
-           array-of-transform-feedback-bindings-buffer-ids
-           array-of-bound-samplers array-of-textures
-           map-of-pipeline-names-to-gl-ids depth-func color-masks
-           depth-mask depth-range depth-clamp cull-face front-face
-           current-stencil-params-front current-stencil-params-back
+         '(id gl-context requested-gl-version bound-thread current-program
+           uninitialized-resources shared surfaces current-surface
+           current-tfs vao-binding-id current-viewport default-viewport
+           current-scissor-viewports default-framebuffer array-of-gpu-buffers
+           draw-fbo-binding fbos array-of-bound-gpu-buffers read-fbo-binding
+           array-of-ubo-bindings-buffer-ids array-of-ssbo-bindings-buffer-ids
+           current-blend-params array-of-transform-feedback-bindings-buffer-ids
+           array-of-bound-samplers array-of-textures array-of-bound-queries
+           depth-func color-masks depth-mask depth-range depth-clamp cull-face
+           front-face current-stencil-params-front current-stencil-params-back
            current-stencil-mask-front current-stencil-mask-back
-           clear-color gl-version-float)))
+           clear-color gl-version-float
+           array-of-ubo-binding-ranges array-of-ssbo-binding-ranges
+           pack-alignment unpack-alignment
+           max-draw-buffer-count instance-count)))
     (assert (every (lambda (x) (member x context-slots :test #'string=)) slots))
     (let ((slots (remove-duplicates slots))
           (accessors (loop :for slot :in slots :collect
@@ -112,10 +164,12 @@
            ,@body)))))
 
 
-(defn surfaces ((cepl-context cepl-context)) list
-  (%cepl-context-surfaces cepl-context))
+(defn-inline context-id ((context cepl-context)) context-id
+  (%cepl-context-id context))
 
-(defn current-surface ((cepl-context cepl-context)) t
-  (%cepl-context-current-surface cepl-context))
+;;----------------------------------------------------------------------
+
+#+sbcl
+(declaim (sb-ext:freeze-type cepl-context))
 
 ;;----------------------------------------------------------------------

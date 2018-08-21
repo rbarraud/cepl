@@ -1,22 +1,35 @@
 (in-package :cepl.pipelines)
-(in-readtable fn:fn-reader)
 
 ;;--------------------------------------------------
 
+(defvar *gpu-func-specs-lock* (bt:make-lock))
 (defvar *gpu-func-specs* nil)
+(defvar *gpu-func-diff-tag* 0)
+
+(defvar *dependent-gpu-functions-lock* (bt:make-lock))
 (defvar *dependent-gpu-functions* nil)
+
+(defvar *gpu-pipeline-specs-lock* (bt:make-lock))
 (defvar *gpu-pipeline-specs* (make-hash-table :test #'eq))
 
+(defvar *cache-last-compile-result* t)
+
+(defvar *map-of-pipeline-names-to-gl-ids-lock* (bt:make-lock))
+
+(defvar *map-of-pipeline-names-to-gl-ids*
+  (make-hash-table :test #'eq))
+
+(defvar *suppress-upload-message* nil)
+
 ;;--------------------------------------------------
 
-(defclass lambda-pipeline-spec ()
-  ((cached-compile-results :initarg :cached-compile-results :initform nil)))
-
-(defclass pipeline-spec ()
-  ((name :initarg :name)
-   (context :initarg :context)
-   (cached-compile-results :initform nil)
-   (vertex-stage :initarg :vertex-stage)
+(defclass pipeline-spec-base ()
+  ((prog-ids
+    :initarg :prog-ids)
+   (cached-compile-results
+    :initarg :cached-compile-results :initform nil)
+   (vertex-stage
+    :initarg :vertex-stage)
    (tessellation-control-stage
     :initarg :tessellation-control-stage :initform nil)
    (tessellation-evaluation-stage
@@ -25,7 +38,51 @@
     :initarg :geometry-stage :initform nil)
    (fragment-stage
     :initarg :fragment-stage :initform nil)
-   prog-id))
+   (compute-stage
+    :initarg :compute-stage :initform nil)))
+
+(defclass lambda-pipeline-spec (pipeline-spec-base)
+  ((vertex-stage :initarg :vertex-stage :initform nil)
+   (recompile-func :initform nil :initarg :recompile-func)
+   ;; ↓ used for debugging purposes
+   (recompile-state :initform nil :initarg :recompile-state)))
+
+(defclass pipeline-spec (pipeline-spec-base)
+  ((name :initarg :name)
+   (context :initarg :context)
+   (diff-tags :initarg :diff-tags :initform nil)))
+
+(defmethod pipeline-stages ((spec pipeline-spec-base))
+  (with-slots (vertex-stage
+               tessellation-control-stage
+               tessellation-evaluation-stage
+               geometry-stage
+               fragment-stage
+               compute-stage) spec
+    (list vertex-stage
+          tessellation-control-stage
+          tessellation-evaluation-stage
+          geometry-stage
+          fragment-stage
+          compute-stage)))
+
+(defmethod pipeline-stage-pairs ((spec pipeline-spec-base))
+  (with-slots (vertex-stage
+               tessellation-control-stage
+               tessellation-evaluation-stage
+               geometry-stage
+               fragment-stage
+               compute-stage) spec
+    (remove-if-not
+     #'cdr
+     (list (cons :vertex vertex-stage)
+           (cons :tessellation-control tessellation-control-stage)
+           (cons :tessellation-evaluation tessellation-evaluation-stage)
+           (cons :geometry geometry-stage)
+           (cons :fragment fragment-stage)
+           (cons :compute compute-stage)))))
+
+;;--------------------------------------------------
 
 (defclass gpu-func-spec ()
   ((name :initarg :name)
@@ -34,61 +91,42 @@
    (actual-uniforms :initarg :actual-uniforms)
    (context :initarg :context)
    (body :initarg :body)
-   (instancing :initarg :instancing)
+   (shared :initarg :shared)
    (equivalent-inargs :initarg :equivalent-inargs)
    (equivalent-uniforms :initarg :equivalent-uniforms)
    (doc-string :initarg :doc-string)
    (declarations :initarg :declarations)
    (missing-dependencies :initarg :missing-dependencies :initform nil)
-   (cached-compile-results :initarg :compiled :initform nil)))
-
-(defmethod pipeline-stages ((spec pipeline-spec))
-  (with-slots (vertex-stage
-               tessellation-control-stage
-               tessellation-evaluation-stage
-               geometry-stage
-               fragment-stage) spec
-    (list vertex-stage
-          tessellation-control-stage
-          tessellation-evaluation-stage
-          geometry-stage
-          fragment-stage)))
-
-(defmethod pipeline-stage-pairs ((spec pipeline-spec))
-  (with-slots (vertex-stage
-               tessellation-control-stage
-               tessellation-evaluation-stage
-               geometry-stage
-               fragment-stage) spec
-    (remove-if-not
-     #'cdr
-     (list (cons :vertex vertex-stage)
-           (cons :tessellation-control tessellation-control-stage)
-           (cons :tessellation-evaluation tessellation-evaluation-stage)
-           (cons :geometry geometry-stage)
-           (cons :fragment fragment-stage)))))
+   (cached-compile-results :initarg :compiled :initform nil)
+   (diff-tag :initarg :diff-tag)))
 
 ;;--------------------------------------------------
 
 (defclass glsl-stage-spec (gpu-func-spec) ())
 
-(defun+ %make-gpu-func-spec (name in-args uniforms context body instancing
+(defun get-gpu-func-spec-tag ()
+  (bt:with-lock-held (*gpu-func-specs-lock*)
+    (incf *gpu-func-diff-tag*)))
+
+(defun+ %make-gpu-func-spec (name in-args uniforms context body shared
                             equivalent-inargs equivalent-uniforms
                             actual-uniforms
-                            doc-string declarations missing-dependencies)
+                            doc-string declarations missing-dependencies
+                            diff-tag)
   (make-instance 'gpu-func-spec
                  :name name
                  :in-args (mapcar #'listify in-args)
                  :uniforms (mapcar #'listify uniforms)
                  :context context
                  :body body
-                 :instancing instancing
+                 :shared shared
                  :equivalent-inargs equivalent-inargs
                  :equivalent-uniforms equivalent-uniforms
                  :actual-uniforms actual-uniforms
                  :doc-string doc-string
                  :declarations declarations
-                 :missing-dependencies missing-dependencies))
+                 :missing-dependencies missing-dependencies
+                 :diff-tag diff-tag))
 
 (defun+ %make-glsl-stage-spec (name in-args uniforms context body-string
                               compiled)
@@ -100,21 +138,24 @@
                    :context context
                    :body body-string
                    :compiled compiled
-                   :instancing nil
+                   :shared nil
                    :equivalent-inargs nil
                    :equivalent-uniforms nil
                    :actual-uniforms uniforms
                    :doc-string nil
                    :declarations nil
-                   :missing-dependencies nil)))
+                   :missing-dependencies nil
+                   :diff-tag (get-gpu-func-spec-tag))))
 
 (defmacro with-gpu-func-spec (func-spec &body body)
-  `(with-slots (name in-args uniforms actual-uniforms context body instancing
+  `(with-slots (name in-args uniforms actual-uniforms context body shared
                      equivalent-inargs equivalent-uniforms doc-string
-                     declarations missing-dependencies) ,func-spec
+                     declarations missing-dependencies diff-tag
+                     cached-compile-results) ,func-spec
      (declare (ignorable name in-args uniforms actual-uniforms context body
-                         instancing equivalent-inargs equivalent-uniforms
-                         doc-string declarations missing-dependencies))
+                         shared equivalent-inargs equivalent-uniforms
+                         doc-string declarations missing-dependencies
+                         diff-tag cached-compile-results))
      ,@body))
 
 (defmacro with-glsl-stage-spec (glsl-stage-spec &body body)
@@ -129,33 +170,68 @@
   (with-gpu-func-spec spec
     `(%make-gpu-func-spec
       ',name ',in-args ',uniforms ',context ',body
-      ',instancing ',equivalent-inargs ',equivalent-uniforms
+      ',shared ',equivalent-inargs ',equivalent-uniforms
       ',actual-uniforms
-      ,doc-string ',declarations ',missing-dependencies)))
+      ,doc-string ',declarations ',missing-dependencies
+      ',diff-tag)))
 
-(defun+ clone-stage-spec (spec &key new-name new-in-args new-uniforms new-context
-                                new-body new-instancing new-equivalent-inargs
-                                new-equivalent-uniforms new-actual-uniforms
-                                new-doc-string new-declarations
-                                new-missing-dependencies)
+(defun+ clone-stage-spec (spec &key (new-context nil set-context))
   (with-gpu-func-spec spec
     (make-instance
      (etypecase spec
        (glsl-stage-spec 'glsl-stage-spec)
        (gpu-func-spec 'gpu-func-spec))
-     :name (or name new-name)
-     :in-args (or in-args new-in-args)
-     :uniforms (or uniforms new-uniforms)
-     :context (or context new-context)
-     :body (or body new-body)
-     :instancing (or instancing new-instancing)
-     :equivalent-inargs (or equivalent-inargs new-equivalent-inargs)
-     :equivalent-uniforms (or equivalent-uniforms new-equivalent-uniforms)
-     :actual-uniforms (or actual-uniforms new-actual-uniforms)
-     :doc-string (or doc-string new-doc-string)
-     :declarations (or declarations new-declarations)
-     :missing-dependencies (or missing-dependencies
-                               new-missing-dependencies))))
+     :name name
+     :in-args in-args
+     :uniforms uniforms
+     :context (if set-context new-context context)
+     :body body
+     :shared shared
+     :equivalent-inargs equivalent-inargs
+     :equivalent-uniforms equivalent-uniforms
+     :actual-uniforms actual-uniforms
+     :doc-string doc-string
+     :declarations declarations
+     :missing-dependencies missing-dependencies
+     :compiled cached-compile-results
+     :diff-tag (or diff-tag (error "CEPL BUG: Diff-tag missing")))))
+
+(defun spec-changed-p (spec old-spec)
+  (or (not spec)
+      (not old-spec)
+      (with-slots ((name-a name)
+                   (in-args-a in-args)
+                   (uniforms-a uniforms)
+                   (actual-uniforms-a actual-uniforms)
+                   (context-a context)
+                   (body-a body)
+                   (shared-a shared)
+                   (equivalent-inargs-a equivalent-inargs)
+                   (equivalent-uniforms-a equivalent-uniforms)
+                   (doc-string-a doc-string)
+                   (declarations-a declarations)
+                   (missing-dependencies-a missing-dependencies)
+                   (diff-tag-a diff-tag)) spec
+        (with-slots ((name-b name)
+                     (in-args-b in-args)
+                     (uniforms-b uniforms)
+                     (actual-uniforms-b actual-uniforms)
+                     (context-b context)
+                     (body-b body)
+                     (shared-b shared)
+                     (equivalent-inargs-b equivalent-inargs)
+                     (equivalent-uniforms-b equivalent-uniforms)
+                     (doc-string-b doc-string)
+                     (declarations-b declarations)
+                     (missing-dependencies-b missing-dependencies)
+                     (diff-tag-b diff-tag)) old-spec
+          (not (and (equal body-a body-b)
+                    (equal context-a context-b)
+                    (equal declarations-a declarations-b)
+                    (equal in-args-a in-args-b)
+                    (equal uniforms-a uniforms-b)
+                    (equal shared-a shared-b)
+                    (equal name-a name-b)))))))
 
 ;;--------------------------------------------------
 
@@ -220,12 +296,24 @@
 (defmethod gpu-func-spec (key &optional error-if-missing)
   (gpu-func-spec (func-key key) error-if-missing))
 
+(defmethod gpu-func-spec ((func-key gpu-func-spec) &optional error-if-missing)
+  (declare (ignore error-if-missing))
+  (error "Trying to get a func spec using a func spec as a key"))
+
 (defmethod gpu-func-spec ((func-key func-key) &optional error-if-missing)
-  (or (assocr func-key *gpu-func-specs* :test #'func-key=)
-      (when error-if-missing
-        (error 'gpu-func-spec-not-found
-               :name (name func-key)
-               :types (in-args func-key)))))
+  (bt:with-lock-held (*gpu-func-specs-lock*)
+    (or (assocr func-key *gpu-func-specs* :test #'func-key=)
+        (when error-if-missing
+          (error 'gpu-func-spec-not-found
+                 :name (name func-key)
+                 :types (in-args func-key))))))
+
+(defgeneric delete-func-spec (func-key)
+  (:method (func-key)
+    (bt:with-lock-held (*gpu-func-specs-lock*)
+      (setf *gpu-func-specs*
+            (remove func-key *gpu-func-specs*
+                    :test #'func-key= :key #'car)))))
 
 (defmethod (setf gpu-func-spec) (value key &optional error-if-missing)
   (setf (gpu-func-spec (func-key key) error-if-missing) value))
@@ -233,49 +321,56 @@
 (defmethod (setf gpu-func-spec) (value (key func-key) &optional error-if-missing)
   (when error-if-missing
     (gpu-func-spec key t))
-  (setf *gpu-func-specs*
-        (remove-duplicates (acons key value *gpu-func-specs*)
-                           :key #'car :test #'func-key=
-                           :from-end t)))
+  (bt:with-lock-held (*gpu-func-specs-lock*)
+    (setf *gpu-func-specs*
+          (remove-duplicates (acons key value *gpu-func-specs*)
+                             :key #'car :test #'func-key=
+                             :from-end t))))
 
 (defun+ gpu-func-specs (name &optional error-if-missing)
-  (or (remove nil
-              (mapcar λ(dbind (k . v) _
-                         (when (eq (name k) name)
-                           v))
-                      *gpu-func-specs*))
-      (when error-if-missing
-        (error 'gpu-func-spec-not-found :spec-name name))))
+  (bt:with-lock-held (*gpu-func-specs-lock*)
+    (or (remove nil
+                (mapcar (lambda (x)
+                          (dbind (k . v) x
+                            (when (eq (name k) name)
+                              v)))
+                        *gpu-func-specs*))
+        (when error-if-missing
+          (error 'gpu-func-spec-not-found :spec-name name)))))
 
 (defmethod %unsubscibe-from-all (spec)
   (%unsubscibe-from-all (func-key spec)))
 
 (defmethod %unsubscibe-from-all ((func-key func-key))
   "As the name would suggest this removes one function's dependency on another
-   It is used by #'%test-&-update-spec via #'%update-gpu-function-data"
+   It is used by #'%test-&-process-spec via #'%update-gpu-function-data"
   (labels ((%remove-gpu-function-from-dependancy-table (pair)
              (dbind (key . dependencies) pair
                (when (member func-key dependencies :test #'func-key=)
                  (setf (funcs-that-use-this-func key)
                        (remove func-key dependencies :test #'func-key=))))))
-    (map nil #'%remove-gpu-function-from-dependancy-table
-         *dependent-gpu-functions*)))
+    (let ((deps
+           (bt:with-lock-held (*dependent-gpu-functions-lock*)
+             (copy-list *dependent-gpu-functions*))))
+      (map nil #'%remove-gpu-function-from-dependancy-table deps))))
 
 (defmethod funcs-that-use-this-func (key)
   (funcs-that-use-this-func (func-key key)))
 
 (defmethod funcs-that-use-this-func ((key func-key))
-  (assocr key *dependent-gpu-functions*
-          :test #'func-key=))
+  (bt:with-lock-held (*dependent-gpu-functions-lock*)
+    (assocr key *dependent-gpu-functions*
+            :test #'func-key=)))
 
 (defmethod (setf funcs-that-use-this-func) (value key)
   (setf (funcs-that-use-this-func (func-key key)) value))
 
 (defmethod (setf funcs-that-use-this-func) (value (key func-key))
+  (bt:with-lock-held (*dependent-gpu-functions-lock*)
     (setf *dependent-gpu-functions*
-     (remove-duplicates (acons key value *dependent-gpu-functions*)
-                        :key #'car :test #'func-key=
-                        :from-end t)))
+          (remove-duplicates (acons key value *dependent-gpu-functions*)
+                             :key #'car :test #'func-key=
+                             :from-end t))))
 
 (defun+ funcs-these-funcs-use (names &optional (include-names t))
   (remove-duplicates
@@ -296,45 +391,55 @@ names are depended on by the functions named later in the list"
            :key #'car)))
 
 (defmethod %funcs-this-func-uses ((key func-key) &optional (depth 0))
-  (let ((this-func-calls
-         (remove nil (mapcar
-                      λ(dbind (k . v) _
-                         (when (member key v)
-                           (cons k depth)))
-                      *dependent-gpu-functions*))))
-    (append this-func-calls
-            (apply #'append
-                   (mapcar λ(%funcs-this-func-uses (car _) (1+ depth))
-                           this-func-calls)))))
-
-(defmethod pipelines-that-use-this-as-a-stage ((func-key func-key))
-  (remove-duplicates
-   (remove nil
-           (map-hash
-            (lambda (k v)
-              (when (and (symbolp k)
-                         (typep v 'pipeline-spec)
-                         (member func-key (pipeline-stages v) :test #'func-key=))
-                k))
-            *gpu-pipeline-specs*))
-   :test #'eq))
+  (bt:with-lock-held (*dependent-gpu-functions-lock*)
+    (let ((this-func-calls
+           (remove nil (mapcar
+                        (lambda (x)
+                          (dbind (k . v) x
+                            (when (member key v)
+                              (cons k depth))))
+                        *dependent-gpu-functions*))))
+      (append this-func-calls
+              (apply #'append
+                     (mapcar (lambda (x)
+                               (%funcs-this-func-uses (car x) (1+ depth)))
+                             this-func-calls))))))
 
 (defun+ update-specs-with-missing-dependencies ()
-  (map 'nil λ(dbind (k . v) _
-               (with-gpu-func-spec v
-                 (when missing-dependencies
-                   (%test-&-update-spec v)
-                   k)))
-       *gpu-func-specs*))
+  (let ((specs (bt:with-lock-held (*gpu-func-specs-lock*)
+                 (copy-list *gpu-func-specs*))))
+    (map 'nil (lambda (x)
+                (dbind (k . v) x
+                  (with-gpu-func-spec v
+                    (when missing-dependencies
+                      (%test-&-process-spec v)
+                      k))))
+         specs)))
 
 (defmethod recompile-pipelines-that-use-this-as-a-stage ((key func-key))
   "Recompile all pipelines that depend on the named gpu function or any other
    gpu function that depends on the named gpu function. It does this by
    triggering a recompile on all pipelines that depend on this glsl-stage"
-  (mapcar λ(let ((recompile-pipeline-name (recompile-name _)))
-             (when (fboundp recompile-pipeline-name)
-               (funcall (symbol-function recompile-pipeline-name))))
-          (pipelines-that-use-this-as-a-stage key)))
+  (let ((funcs nil))
+    (bt:with-lock-held (*gpu-pipeline-specs-lock*)
+      (maphash
+       (lambda (k v)
+         (cond
+           (;; top level pipelines
+            (and (symbolp k)
+                 (typep v 'pipeline-spec)
+                 (member key (pipeline-stages v) :test #'func-key=))
+            (let ((name (recompile-name k)))
+              (when (and name (fboundp name))
+                (push name funcs))))
+           (;; lambda pipelines
+            (and (typep v 'lambda-pipeline-spec)
+                 (member key (pipeline-stages v) :test #'func-key=))
+            (with-slots (recompile-func) v
+              (when recompile-func
+                (push recompile-func funcs))))))
+       *gpu-pipeline-specs*))
+    (map nil #'funcall funcs)))
 
 (defmethod %gpu-function ((name symbol))
   (let ((choices (gpu-functions name)))
@@ -362,8 +467,9 @@ names are depended on by the functions named later in the list"
   (%gpu-function name))
 
 (defun+ gpu-functions (name)
-  (mapcar λ(cons (slot-value _ 'name)
-                 (mapcar #'second (slot-value _ 'in-args)))
+  (mapcar (lambda (x)
+            (cons (slot-value x 'name)
+                  (mapcar #'second (slot-value x 'in-args))))
           (gpu-func-specs name)))
 
 (defun+ read-gpu-function-choice (intro-text gfunc-name)
@@ -384,32 +490,47 @@ names are depended on by the functions named later in the list"
 
 ;;--------------------------------------------------
 
-(defvar +cache-last-compile-result+ t)
+(defun+ recompile-name (name)
+  (hidden-symb name :recompile-pipeline))
 
-(defun+ make-lambda-pipeline-spec (compiled-stages)
+(defun+ make-lambda-pipeline-spec (prog-id compiled-stages)
   (make-instance 'lambda-pipeline-spec
-                 :cached-compile-results compiled-stages))
+                 :cached-compile-results compiled-stages
+                 :prog-ids prog-id))
 
 (defun+ make-pipeline-spec (name stages context)
   (dbind (&key vertex tessellation-control tessellation-evaluation
-               geometry fragment) (flatten stages)
-    (make-instance 'pipeline-spec
-                   :name name
-                   :vertex-stage vertex
-                   :tessellation-control-stage tessellation-control
-                   :tessellation-evaluation-stage tessellation-evaluation
-                   :geometry-stage geometry
-                   :fragment-stage fragment
-                   :context context)))
+               geometry fragment compute) (flatten stages)
+    (let ((context (parse-compile-context name context :pipeline))
+          (tags (mapcar (lambda (x)
+                          (when x (slot-value x 'diff-tag)))
+                        (list vertex
+                              tessellation-control
+                              tessellation-evaluation
+                              geometry
+                              fragment
+                              compute))))
+      (make-instance 'pipeline-spec
+                     :name name
+                     :vertex-stage vertex
+                     :tessellation-control-stage tessellation-control
+                     :tessellation-evaluation-stage tessellation-evaluation
+                     :geometry-stage geometry
+                     :fragment-stage fragment
+                     :compute-stage compute
+                     :diff-tags tags
+                     :context context))))
 
 (defun+ pipeline-spec (name)
-  (let ((res (gethash name *gpu-pipeline-specs*)))
+  (let ((res (bt:with-lock-held (*gpu-pipeline-specs-lock*)
+               (gethash name *gpu-pipeline-specs*))))
     (if (and res (symbolp res))
         (pipeline-spec res)
         res)))
 
 (defun+ (setf pipeline-spec) (value name)
-  (setf (gethash name *gpu-pipeline-specs*) value))
+  (bt:with-lock-held (*gpu-pipeline-specs-lock*)
+    (setf (gethash name *gpu-pipeline-specs*) value)))
 
 (defun+ update-pipeline-spec (spec)
   (setf (pipeline-spec (slot-value spec 'name)) spec))
@@ -420,7 +541,8 @@ names are depended on by the functions named later in the list"
 
 (defun+ function-keyed-pipeline (func)
   (assert (typep func 'function))
-  (let ((spec (gethash func *gpu-pipeline-specs*)))
+  (let ((spec (bt:with-lock-held (*gpu-pipeline-specs-lock*)
+                (gethash func *gpu-pipeline-specs*))))
     (if (typep spec 'lambda-pipeline-spec)
         spec
         (pipeline-spec spec))))
@@ -428,22 +550,23 @@ names are depended on by the functions named later in the list"
 (defun+ (setf function-keyed-pipeline) (spec func)
   (assert (typep func 'function))
   (assert (or (symbolp spec) (typep spec 'lambda-pipeline-spec)))
-  (labels ((scan (k v)
-             (when (eq v spec)
-               (remhash k *gpu-pipeline-specs*))))
-    ;; and this is a horribly lazy hack. We need a better
-    ;; mechanism for this.
-    (when (symbolp spec)
-      (maphash #'scan *gpu-pipeline-specs*)))
-  (setf (gethash func *gpu-pipeline-specs*)
-        spec))
+  (bt:with-lock-held (*gpu-pipeline-specs-lock*)
+    (labels ((scan (k v)
+               (when (eq v spec)
+                 (remhash k *gpu-pipeline-specs*))))
+      ;; and this is a horribly lazy hack. We need a better
+      ;; mechanism for this.
+      (when (symbolp spec)
+        (maphash #'scan *gpu-pipeline-specs*)))
+    (setf (gethash func *gpu-pipeline-specs*)
+          spec)))
 
 (defun+ %pull-spec-common (asset-name)
   (labels ((gfunc-spec (x)
              (handler-case (gpu-func-spec (%gpu-function x))
                (cepl.errors:gpu-func-spec-not-found ()
                  nil))))
-    (if +cache-last-compile-result+
+    (if *cache-last-compile-result*
         (let ((spec (or (pipeline-spec asset-name) (gfunc-spec asset-name))))
           (typecase spec
             (null (warn 'pull-g-not-cached :asset-name asset-name))
@@ -479,37 +602,46 @@ names are depended on by the functions named later in the list"
       (use-value ()
         (%gpu-function (interactive-pick-gpu-function asset-name))))))
 
-(defmethod pull-g ((pipeline-func function))
-  (let ((pipeline (function-keyed-pipeline pipeline-func)))
-    (etypecase pipeline
-      (null (warn 'func-keyed-pipeline-not-found
-                  :callee 'pull-g :func pipeline-func))
-      ((or pipeline-spec lambda-pipeline-spec)
-       (let ((compiled (slot-value pipeline 'cached-compile-results)))
-         (if compiled
-             (mapcar #'varjo:glsl-code compiled)
-             (warn 'func-keyed-pipeline-not-found
-                   :callee 'pull-g :func pipeline-func)))))))
+(defmethod pull-g ((func function))
+  (let ((compiled (listify (pull1-g func))))
+    (when compiled
+      (mapcar #'varjo:glsl-code compiled))))
 
-(defmethod pull1-g ((pipeline-func function))
-  (let ((pipeline (function-keyed-pipeline pipeline-func)))
-    (etypecase pipeline
-      (null (warn 'func-keyed-pipeline-not-found
-                  :callee 'pull1-g :func pipeline-func))
-      ((or pipeline-spec lambda-pipeline-spec)
-       (or (slot-value pipeline 'cached-compile-results)
-           (warn 'func-keyed-pipeline-not-found
-                 :callee 'pull1-g :func pipeline-func))))))
+(defmethod pull1-g ((func function))
+  (handler-case
+      (let ((spec (lambda-g->func-spec func)))
+        (slot-value spec 'cached-compile-results))
+    (not-a-gpu-lambda ()
+      (let ((pipeline (function-keyed-pipeline func)))
+        (etypecase pipeline
+          (null (warn 'func-keyed-pipeline-not-found
+                      :callee 'pull1-g :func func))
+          ((or pipeline-spec lambda-pipeline-spec)
+           (or (slot-value pipeline 'cached-compile-results)
+               (warn 'func-keyed-pipeline-not-found
+                     :callee 'pull1-g :func func))))))))
 
 ;;--------------------------------------------------
 
-(defun+ request-program-id-for (name)
-  (%with-cepl-context-slots (map-of-pipeline-names-to-gl-ids) (cepl-context)
-    (if name
-        (or (gethash name map-of-pipeline-names-to-gl-ids)
-            (setf (gethash name map-of-pipeline-names-to-gl-ids)
-                  (%gl:create-program)))
-        (%gl:create-program))))
+(defun+ request-program-id-for (context name)
+  (bt:with-lock-held (*map-of-pipeline-names-to-gl-ids-lock*)
+    (%with-cepl-context-slots (id) context
+      (let ((context-id id))
+        (if name
+            ;; named pipelines need to handle multiple contexts
+            (let* ((map (or (gethash name *map-of-pipeline-names-to-gl-ids*)
+                            (make-array cepl.context:+max-context-count+
+                                        :initial-element +unknown-gl-id+
+                                        :element-type 'gl-id)))
+                   (prog-id (aref map context-id)))
+              (when (= prog-id +unknown-gl-id+)
+                (setf prog-id (%gl:create-program))
+                (setf (aref map context-id) prog-id)
+                (setf (gethash name *map-of-pipeline-names-to-gl-ids*) map))
+              (values map prog-id))
+            ;; lambda pipelines are locked to a specific context
+            (let ((prog-id (%gl:create-program)))
+              (values prog-id prog-id)))))))
 
 ;;--------------------------------------------------
 
@@ -520,23 +652,21 @@ names are depended on by the functions named later in the list"
     (varjo::tessellation-control-stage :tess-control-shader)
     (varjo::geometry-stage :geometry-shader)
     (varjo::fragment-stage :fragment-shader)
+    (varjo::compute-stage :compute-shader)
     (t (error "CEPL: ~a is not a known type of shader stage"
               (type-of stage)))))
 
 ;;--------------------------------------------------
 
-(declaim (type (unsigned-byte 16) |*instance-count*|))
-(defvar |*instance-count*| 0)
-
 (defmacro with-instances (count &body body)
-  `(let ((|*instance-count*| ,count))
-     (unless (> |*instance-count*| 0)
-       (error "Instance count must be greater than 0"))
-     ,@body))
-
-;;--------------------------------------------------
-
-(defun+ recompile-name (name) (symb-package :cepl '~~- name))
+  (alexandria:with-gensyms (ctx cnt old-cnt)
+    `(with-cepl-context (,ctx)
+       (%with-cepl-context-slots (instance-count) ,ctx
+         (let ((,cnt ,count)
+               (,old-cnt instance-count))
+           (setf instance-count ,cnt)
+           (unwind-protect (progn ,@body)
+             (setf instance-count ,old-cnt)))))))
 
 ;;--------------------------------------------------
 

@@ -12,7 +12,7 @@ with the in-arg types ~s"
     "Looks like you tried to call the pipeline ~s without using map-g.~%" name)
 
 (deferror invalid-keywords-for-shader-gpipe-args () (pipeline-name keys)
-    "Found some invalid keys in the g-> for for the pipeline called ~a:~%~s"
+    "Found some invalid keys in the pipeline called ~a:~%~s"
   pipeline-name keys)
 
 (deferror invalid-context-for-assert-gpipe () (context)
@@ -24,7 +24,7 @@ with the in-arg types ~s"
   context)
 
 (deferror invalid-shader-gpipe-form () (pipeline-name valid-forms invalid-forms)
-    "When using defpipeline-g to compose GPU functions, the valid arguments to g-> are function literals~%(optionally with keyword stage names).~%~%In the defpipeline-g for ~a ~athese forms were not valid:~%~{~s~%~}~%"
+    "When using defpipeline-g to compose GPU functions, the valid stage specifiers are function literals~%(optionally with keyword stage names).~%~%In the defpipeline-g for ~a ~athese forms were not valid:~%~{~s~%~}~%"
   pipeline-name
   (if valid-forms
       (format nil "these forms were valid:~%~{~s~%~}~%However"
@@ -33,7 +33,7 @@ with the in-arg types ~s"
   invalid-forms)
 
 (deferror not-enough-args-for-implicit-gpipe-stages () (pipeline-name clauses)
-    "Tried to compile the g-> form for the ~a pipeline; however, there are not enough functions here for a valid pipeline:~%~s"
+    "Tried to compile the pipeline ~a; however, there are not enough functions here for a valid pipeline:~%~s"
   pipeline-name clauses)
 
 (deferror invalid-shader-gpipe-stage-keys () (pipeline-name keys)
@@ -132,17 +132,9 @@ internal texture format"
     "with-model-space: please dont try redefining the relationship between ~s and itself."
   space)
 
-(deferror make-buffer-stream-with-no-gpu-arrays () ()
-    "Cepl: Invalid attempt to make buffer-stream with no gpu-arrays")
-
-(deferror invalid-context-for-def-glsl-stage () (name context)
-    "CEPL: Invalid context supplied for glsl-stage ~a:
-The context must, at least, contain:
-- One of the following versions: ~a
-- One of the following stage names: ~a
-
-Instead recieved: ~a"
-  name varjo:*supported-versions* varjo:*stage-names* context)
+(deferror index-on-buffer-stream-with-no-gpu-arrays () ()
+    "Cepl: Invalid attempt to make buffer-stream with an index array even
+though there were no gpu-arrays.")
 
 (deferror struct-in-glsl-stage-args () (arg-names)
     "Found arguments to def-glsl-stage which have struct types.
@@ -203,10 +195,10 @@ uploading data to a buffer-backed texture.
 Pixel-format: ~s"
   pixel-format)
 
-(deferror glsl-version-conflict () (pairs)
+(deferror glsl-version-conflict () (issue)
     "CEPL: When trying to compile the pipeline we found some stages which have
 conflicting glsl version requirements:
-~{~s~%~}" pairs)
+~{~s~%~}" issue)
 
 (deferror glsl-version-conflict-in-gpu-func () (name context)
     "CEPL: When trying to compile ~a we found multiple glsl versions.
@@ -231,16 +223,17 @@ has not been cached yet"
 
 (deferror pull*-g-not-enabled () ()
     "CEPL has been set to not cache the results of pipeline compilation.
-See the +cache-last-compile-result+ constant for more details")
+See the *cache-last-compile-result* var for more details")
 
 (defwarning func-keyed-pipeline-not-found () (callee func)
     "CEPL: ~a was called with ~a.
 
-When functions are passed to ~a we assume this is a pipeline function and looked
-for the details for that pipeline. However we didn't find anything.
+When functions are passed to ~a we assume this is a either pipeline function
+or a gpu-lambda. After checking that is wasnt a gpu-lambda we looked for the
+details for a matching pipeline. However we didn't find anything.
 
-Please note that you cannot lookup gpu-functions in this way as, due to
-overloading, many gpu-functions map to a single function object."
+Please note that you cannot lookup non-lambda gpu-functions in this way as,
+due to overloading, many gpu-functions map to a single function object."
   callee func callee)
 
 (deferror attachments-with-different-sizes (:print-circle nil) (args sizes)
@@ -350,7 +343,7 @@ Might you have meant to specify a gpu function?"
   invalid)
 
 (deferror partial-lambda-pipeline (:print-circle nil) (partial-stages)
-    "CEPL: G-> was called with at least one stage taking functions as uniform
+    "CEPL: pipeline-g was called with at least one stage taking functions as uniform
 arguments.
 
 If this were defpipeline-g we would make a partial pipeline however we don't
@@ -403,12 +396,12 @@ which is sharing a gpu-buffer with other gpu-arrays.
 Array: ~a is sharing a gpu buffer with ~a other gpu-arrays"
   array shared-count)
 
-(deferror buffer-stream-has-invalid-primtive-for-stream ()
+(deferror buffer-stream-has-invalid-primitive-for-stream ()
     (name pline-prim stream-prim)
     "CEPL: The buffer-stream passed to ~a contains ~s, however ~a
 was expecting ~s.
 
-You can either change the type of primtives the pipeline was expecting e.g:
+You can either change the type of primitives the pipeline was expecting e.g:
 
  (defpipeline-g ~s (~s)
    ..)
@@ -461,6 +454,565 @@ your code, you will get this error on the next compile unless it is fixed~]"
       "a match")
   alternatives
   (not (null env)))
+
+(deferror gl-context-initialized-from-incorrect-thread ()
+    (ctx-thread init-thread)
+    "CEPL: This CEPL context is tied to thread A (shown below) however something
+tried to create the gl-context from thread B:
+A: ~a
+B: ~a"
+  ctx-thread init-thread)
+
+(deferror shared-context-created-from-incorrect-thread ()
+    (ctx-thread init-thread)
+    "CEPL: This CEPL context is tied to thread A (shown below) however something
+tried to create a shared CEPL context using it from thread B:
+A: ~a
+B: ~a"
+  ctx-thread init-thread)
+
+(deferror tried-to-make-context-on-thread-that-already-has-one ()
+    (context thread)
+    "CEPL: An attempt was made to create a context on thread ~a however
+that thread already has the CEPL context ~a.
+
+In CEPL you may only have 1 CEPL context per thread. That context then holds
+the handles to any GL contexts and any caching related to those gl contexts"
+  thread context)
+
+(deferror max-context-count-reached () (max)
+    "CEPL: Currently CEPL has a silly restriction on the number of contexts
+that can be active at once. The current maximum is max.
+
+It's silly in that GL itself doesnt have this restriction and it was only
+introduced in CEPL to make the implementation of multi-threading simpler.
+
+This restriction does need to be removed however so if you are hitting
+this then please report it at https://github.com/cbaggers/cepl. This lets us
+know that this is causing real issues for people and we can prioritize it
+accordingingly.")
+
+(deferror nested-with-transform-feedback () ()
+    "CEPL: Detected a nested with-transform-feedback form.
+
+Currently this is not supported however in future it may be possible
+to support on GLv4 and up.")
+
+(deferror non-consecutive-feedback-groups () (groups)
+    "CEPL: Currently when you specify transform-feedback groups their
+numbers must be consecutive and there must be at least one value being written
+to :feedback or (:feedback 0).
+
+We hope to be able to relax this in future when we support more recent
+GL features, however even then if you want maximum compatibility this
+will remain a good rule to follow.
+
+These were the groups in question: ~s" groups)
+
+(deferror mixed-pipelines-in-with-tb () ()
+    "CEPL: Different pipelines have been called within same tfs block")
+
+(deferror incorrect-number-of-arrays-in-tfs () (tfs tfs-count count)
+    "CEPL: The transform feedback stream currently bound has ~a arrays bound,
+however the current pipeline is expecting to write into ~a ~a.
+
+The stream in question was:~%~a"
+  tfs-count
+  count
+  (if (= count 1) "array" "arrays")
+  tfs)
+
+(deferror invalid-args-in-make-tfs () (args)
+    "CEPL: make-transform-feedback-stream was called with some arguments that
+are not buffer-backed gpu-arrays:~{~%~s~}" args)
+
+(defwarning tfs-setf-arrays-whilst-bound () ()
+    "CEPL: There was an attempt to setf the arrays attached to the
+transform-feedback-stream whilst it is bound inside with-transform-feedback.
+
+It is not possible to make these changes whilst in the block so we will apply
+them at the end of with-transform-feedback's scope")
+
+(deferror one-stage-non-explicit () ()
+    "CEPL: When defining a pipeline with only 1 stage you need to explicitly
+mark what stage it is as CEPL is unable to infer this.
+
+For example:
+
+    (defpipeline-g some-pipeline ()
+      :vertex (some-stage :vec4))")
+
+(deferror invalid-stage-for-single-stage-pipeline () (kind)
+    "CEPL: We found a pipeline where the only stage was of type ~a.
+Single stage pipelines are valid in CEPL however only if the stage is
+a vertex, fragment or compute stage" kind)
+
+(deferror pipeline-recompile-in-tfb-scope () (name)
+    "CEPL: We were about to recompile the GL program behind ~a however we
+noticed that this is happening inside the scope of with-transform-feedback
+which GL does not allow. Sorry about that." name)
+
+(deferror compile-g-missing-requested-feature () (form)
+    "CEPL: Sorry currently compile-g can only be used to make gpu lambdas
+by passing nil as the name and the source for the lambda like this:
+
+    (lambda-g ((vert :vec4) &uniform (factor :float))
+      (* vert factor))
+
+We recieved:
+~a
+" form)
+
+(deferror query-is-already-active () (query)
+    "CEPL: An attempt was made to start querying using the query object listed
+below, however that query object is currently in use.
+
+query: ~s" query)
+
+(deferror query-is-active-bug () (query)
+    "CEPL BUG: This error should never be hit as it should have
+been covered by another assert inside #'begin-gpu-query.
+
+we are sorry for the mistake. If you have the time please report the issue
+here: https://github.com/cbaggers/cepl/issues
+
+query: ~s" query)
+
+(deferror another-query-is-active () (query current)
+    "CEPL: An attempt was made to begin querying with query object 'A' listed
+below however query object 'B' of the same kind was already active on this
+context. GL only allows 1 query of this kind to be active at a given time.
+
+Query A: ~s
+Query B: ~s" query current)
+
+(deferror query-not-active () (query)
+    "CEPL: A call was made to #'end-gpu-query with the query object listed
+below. The issue is that the query object is not currently active so it is
+not valid to try and make it inactive.
+
+Query: ~s" query)
+
+(deferror compute-pipeline-must-be-single-stage () (name stages)
+    "CEPL: A attempt was made to compile ~a which contains the following
+stage kinds: ~a
+
+However if you include a compute stage it is the only stage allowed in the
+pipeline. Please either remove the compute stage or remove the other stages."
+  (if name name "a pipeline")
+  stages)
+
+(deferror could-not-layout-type () (type)
+    "CEPL BUG: We were unable to work out the layout for the type ~a
+
+We are sorry for the mistake. If you have the time please report the issue
+here: https://github.com/cbaggers/cepl/issues
+
+   (if you are able to include the definition of the type in the
+    issue report that we be excedingly helpful)" type)
+
+(deferror invalid-data-layout-specifier () (specifier valid-specifiers)
+    "CEPL: ~a is not a valid layout data specifier.
+Please use one of the following: ~{~a~^, ~}"
+  specifier valid-specifiers)
+
+(deferror invalid-layout-for-inargs () (name type-name layout)
+    "CEPL: ~a is not a valid type for ~a's input arguments as it has
+the layout ~a.
+
+~a can only be used for uniforms marked as :ubo or :ssbo."
+  type-name
+  (or name "this lambda pipeline")
+  layout
+  type-name)
+
+(deferror invalid-layout-for-uniform () (name type-name layout func-p)
+    "CEPL: ~a is not a valid type for ~a's uniform argument as it has
+the layout ~a. std-140 & std-430 layouts are only valid for ubo & ssbo
+uniforms."
+  type-name
+  (or name
+      (if func-p
+          "this gpu-lambda"
+          "this lambda pipeline"))
+  layout)
+
+(deferror c-array-total-size-type-error () (size required-type)
+    "CEPL: c-array's total size must be of type c-array-index,
+also known as ~a. Total size found was ~a"
+  (upgraded-array-element-type required-type)
+  size)
+
+(deferror state-restore-limitation-transform-feedback () ()
+    "CEPL: State restoring currently cannot be used from within the dynamic
+scope of a transform feedback")
+
+(deferror state-restore-limitation-blending () ()
+    "CEPL: State restoring currently cannot be used from within the dynamic
+scope of with-blending (may have been introduced by with-fbo-bound)")
+
+(deferror state-restore-limitation-queries () ()
+    "CEPL: State restoring currently cannot be used from within the dynamic
+scope of with-blending (may have been introduced by with-fbo-bound)")
+
+
+(deferror fbo-binding-missing () (kind current-surface)
+    "CEPL: FBO ~a bindings missing from context.
+~a"
+  (string-downcase (string kind))
+  (if current-surface
+      ""
+      "This is probably due to there being no surface current on this context"))
+
+(deferror texture-dimensions-lequal-zero () (dimensions)
+    "CEPL: Found an request to make a texture where at least one of the
+dimensions were less than or equal to zero.
+
+Dimensions: ~a"
+  dimensions)
+
+(deferror unknown-symbols-in-pipeline-context () (name full issue for)
+    "
+CEPL: Found something we didnt recognise in the context of ~a
+
+Problematic symbol/s: ~{~s~^, ~}
+Full context: ~s
+
+The pipeline context must contain:
+
+The symbol :static at most once and..
+
+..0 or more of the following glsl versions:~{~%- :~a~}
+
+and at most 1 primitive from:
+- :dynamic
+- :points
+- :lines
+- :iso-lines
+- :line-loop
+- :line-strip
+- :lines-adjacency
+- :line-strip-adjacency
+- :triangles
+- :triangle-fan
+- :triangle-strip
+- :triangles-adjacency
+- :triangle-strip-adjacency
+- (:patch <patch length>)
+"
+  (ecase for
+    (:function
+     (if name
+         (format nil "the gpu-function named ~a." name)
+         (format nil "a gpu-lambda.")))
+    (:pipeline
+     (if name
+         (format nil "the pipeline named ~a." name)
+         (format nil "a lambda pipeline.")))
+    (:glsl-stage
+     (if name
+         (format nil "the glsl stage named ~a." name)
+         (format nil "a glsl stage.")))) ;; this one should never happend
+  issue
+  full
+  varjo:*supported-versions*)
+
+(deferror stage-in-context-only-valid-for-glsl-stages () (name)
+    "
+~a had a stage declaration in it's `compile-context` list
+this is only valid for gpu-functions & glsl stages.
+"
+  (if name
+      (format nil "The pipeline named ~a" name)
+      "A lambda pipeline"))
+
+(deferror unknown-stage-kind () (stage)
+    "
+Unknown stage kind '~a'
+
+Valid stage kinds are:~{~%- ~s~}"
+  stage
+  varjo:*stage-names*)
+
+(deferror stage-not-valid-for-function-restriction () (name stage func-stage)
+    "
+When compiling ~a we found that the function being used as the ~a stage has
+a restriction that means it is only valid to be used as a ~a stage.
+"
+  (or name "a lambda pipeline")
+  stage
+  func-stage)
+
+(deferror gl-version-too-low-for-empty-fbos () (version)
+    "
+We found a valid attempt to create an empty fbo, however these are only
+supported in GL versions 4.3 and above.
+
+Current version: ~a
+" version)
+
+(deferror invalid-attachments-for-empty-fbo () (args)
+    "
+When defining an empty fbo there can be 0 or 1 attachment
+declarations. When present it's name must be NIL.
+
+For example:
+- `(make-fbo '(nil :dimensions (1024 1024)))`
+- `(make-fbo '(nil))`
+- `(make-fbo)`
+
+You may also optionally specify the following parameters as you would
+in `make-texture`:
+
+- :dimensions
+- :layer-count
+- :samples
+- :fixed-sample-locations
+
+The empty fbo can be 1 or 2 dimensional
+
+In this case we were passed the following declarations:~{~%- ~s~}
+" args)
+
+(deferror invalid-empty-fbo-declaration () (decl)
+    "
+When defining an empty fbo there can only be 1 attachment declaration,
+it's name must be NIL, and dimensions must be specified.
+
+For example: `(make-fbo '(nil :dimensions (1024 1024))`
+
+Dimensions can be 1 or 2 dimensional
+
+You may also optionally specify the following parameters as you would
+in `make-texture`:
+
+- :layer-count
+- :samples
+- :fixed-sample-locations
+
+In this case we were passed the following declaration:~%- ~s
+" decl)
+
+(deferror quote-symbol-found-in-fbo-dimensions () (form)
+    "
+During creation of an fbo we found the quote symbol in the 'dimensions'
+portion of the attachment form.
+
+As the attachment form was already quoted this is unnecessary.
+
+Form: ~s
+" form)
+
+(deferror attachment-viewport-empty-fbo () (fbo attachment)
+    "
+`T` cannot be used as a attachment-name. It is only allowed in
+`with-fbo-viewport` & `with-fbo-bound`'s 'attachment-for-size' parameter
+and only if the fbo being bound is empty.
+
+Likewise, when trying to use the above (and only the above) on an empty fbo,
+the attachment name *must* be 'T'.
+
+FBO Found: ~a
+Attachment: ~a
+" fbo attachment)
+
+(deferror invalid-fbo-args () (args)
+    "
+")
+
+(deferror invalid-sampler-wrap-value () (sampler value)
+    "
+CEPL: Invalid value provided for 'wrap' of sampler:
+
+Sampler: ~a
+Value: ~s
+
+The value must be one of the following
+- :repeat
+- :mirrored-repeat
+- :clamp-to-edge
+- :clamp-to-border
+- :mirror-clamp-to-edge
+
+or a vector of 3 of the above keywords.
+" sampler value)
+
+(deferror make-gpu-buffer-from-id-clashing-keys () (args)
+    "
+CEPL: When calling make-gpu-buffer-from-id you can pass in either
+initial-contents or layout, but not both.
+
+Args: ~s
+" args)
+
+(deferror invalid-gpu-buffer-layout () (layout)
+    "
+CEPL: When calling make-gpu-buffer-from-id and passing in layouts, each
+layout must be either:
+
+- A positive integer representing a size in bytes
+- A list contain both :dimensions and :element-type &key arguments.
+
+e.g.
+- 512
+- '(:dimensions (10 20) :element-type :uint8)
+
+layout: ~s
+" layout)
+
+(deferror invalid-gpu-arrays-layout () (layout)
+    "
+CEPL: When calling make-gpu-arrays-from-buffer-id each layout must be
+a list containing both :dimensions and :element-type &key arguments.
+
+e.g.
+- '(:dimensions (10 20) :element-type :uint8)
+
+layout: ~s
+" layout)
+
+(deferror gpu-array-from-id-missing-args () (element-type dimensions)
+    "
+CEPL: When calling make-gpu-array-from-buffer-id element-type and
+dimensions as mandatory.
+
+element-type: ~s
+dimensions: ~s
+" element-type dimensions)
+
+(deferror gpu-array-from-buffer-missing-args () (element-type dimensions)
+    "
+CEPL: When calling make-gpu-array-from-buffer element-type and
+dimensions as mandatory.
+
+element-type: ~s
+dimensions: ~s
+" element-type dimensions)
+
+(deferror quote-in-buffer-layout () (layout)
+    "
+CEPL: The symbol 'quote' was found in the gpu-buffer layout, making the
+layout list invalid. This was probably a typo.
+
+layout: ~s
+" layout)
+
+(deferror make-arrays-layout-mismatch () (current-sizes requested-sizes)
+    "
+CEPL: When settting make-gpu-array-from-buffer's :keep-data argument
+to T you are requesting that the arrays are made using the existing contents
+of the buffer. However, in this case the byte size of the requested gpu arrays
+would not fit in the current available sections of the gpu-buffer.
+
+Current Section Sizes: ~a
+Requested gpu-array sizes: ~a
+" current-sizes requested-sizes)
+
+(deferror make-arrays-layout-count-mismatch () (current-count layouts)
+    "
+CEPL: When settting make-gpu-array-from-buffer's :keep-data argument
+to T you are requesting that the arrays are made using the existing contents
+of the buffer. However, in this case the number of layouts provided (~s) does
+not match the number of sections in the gpu-buffer (~s).
+
+Layouts: ~s
+" (length layouts) current-count layouts)
+
+(deferror cannot-keep-data-when-uploading () (data)
+    "
+CEPL: When calling make-gpu-buffer-from-id with keep-data it is not valid
+to pass initial-contents. The reason is that we would be required to upload
+the data in those c-arrays, which means we would not be keeping our promise
+to 'keep-data'.
+
+keep-data can be used when passing layouts instead of initial-contents as
+there we are just replacing CEPL's understanding of the layout of data in
+the buffer, without changing what is actually there.
+
+initial-contents provided:
+~s
+" data)
+
+(deferror invalid-stream-layout () (layout)
+    "
+CEPL: When calling make-buffer-stream-from-id-and-layouts each
+layout must be a list containing both :dimensions and :element-type
+&key arguments.
+
+e.g.
+- '(:dimensions (500) :element-type :vec3)
+
+layout: ~s
+" layout)
+
+(deferror index-on-buffer-stream-with-no-gpu-layouts () ()
+    "
+CEPL: Invalid attempt to make buffer-stream with an index layout even
+though there were no data layouts.")
+
+(deferror cannot-extract-stream-length-from-layouts () (layouts)
+    "
+CEPL: We were unable to compute a suitable length for the buffer-stream
+as at least one of the data-layouts had an unknown length and there was
+no index-layout for us to take into account
+
+layouts: ~s" layouts)
+
+(deferror index-layout-with-unknown-length () (layout)
+    "
+CEPL: When make-buffer-stream-from-id-and-layouts is called and an index
+layout is provided, it may not have '?' as the dimensions.
+
+layout: ~s" layout)
+
+(deferror inconsistent-struct-layout () (name target slots)
+    "
+CEPL: the attempt to define the gpu-structs named ~a failed as, whilst it was
+defined to have a ~a layout, the following slots had different layouts:
+~{~%- ~a~}
+" name target slots)
+
+(deferror not-a-gpu-lambda () (thing)
+    "CEPL: ~a does not appear to be a gpu-lambda"
+  thing)
+
+(deferror bad-c-array-element () (incorrect-type
+                                  correct-type
+                                  elem
+                                  initial-contents
+                                  extra-info-string)
+    "
+CEPL: The first element in the initial-contents to the array being created
+is a ~a, this is not valid for an array of ~a
+
+First Value: ~s
+Initial-Contents: ~s~@[~%~%~a~]"
+  incorrect-type
+  correct-type
+  elem
+  initial-contents
+  extra-info-string)
+
+(deferror no-named-stages () (stages)
+    "
+CEPL: Small issue in a pipeline definition. Only a pipeline with 2 stages can
+be implicitly named, others must have explicit named stages.
+
+In this case we recieved the following for the stages:
+
+~{~s~%~}
+Each of these stages will need to be named with one each of the following:
+~{~%- ~a~}"
+  stages
+  varjo.api:*stage-names*)
+
+(deferror bad-type-for-buffer-stream-data () (type)
+    "
+CEPL: ~s is not a type we can use for the data passed to the shader in a
+buffer-stream or vao as glsl does not directly support that type.~@[~%~%~a~]"
+  type
+  (when (find type '(:short :ushort :signed-short :unsigned-short))
+    "Perhaps this was meant to be used as the index?"))
 
 ;; Please remember the following 2 things
 ;;

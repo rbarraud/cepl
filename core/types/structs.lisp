@@ -1,56 +1,107 @@
 (in-package :cepl.types)
 
-(defvar *cpu->gpu-vec-mappings*
-  '((:uint8-vec2 . :vec2)
-    (:uint8-vec3 . :vec3)
-    (:uint8-vec4 . :vec4)))
+;;------------------------------------------------------------
+
+(define-const +cpu->gpu-vec-mappings+
+    '((:uint8-vec2 . :vec2)
+      (:uint8-vec3 . :vec3)
+      (:uint8-vec4 . :vec4))
+  :type list)
+
+;;------------------------------------------------------------
+
+(defvar *struct-slot-defs* (make-hash-table))
+
+(defun g-struct-info (name &key (error-if-not-found t))
+  (let ((res (gethash name *struct-slot-defs*)))
+    (when (and error-if-not-found (not res))
+      (error "CEPL BUG: Struct info for type-spec ~a not found"
+             name))
+    res))
+
+(defun (setf g-struct-info) (slots name)
+  (setf (gethash name *struct-slot-defs*)
+        slots))
+
+;;------------------------------------------------------------
+
+(defclass cepl-struct-definition ()
+  ((name :initarg :name :reader s-name)
+   (foreign-name :initarg :foreign-name :reader s-foreign-name)
+   (layout :initarg :layout :reader s-layout)
+   (slots :initarg :slots :reader s-slots)))
+
+(defmethod make-load-form ((obj cepl-struct-definition) &optional environment)
+  (declare (ignore environment))
+  (with-slots (name foreign-name layout slots) obj
+    `(make-instance 'cepl-struct-definition
+                    :name ',name
+                    :foreign-name ',foreign-name
+                    :layout ',layout
+                    :slots ',slots)))
 
 ;;------------------------------------------------------------
 
 (defgeneric s-arrayp (object))
-(defgeneric s-prim-p (object))
-(defgeneric s-extra-prim-p (object))
 (defgeneric s-def (object))
 (defgeneric s-slot-args (slot args))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defclass gl-struct-slot ()
-    ((name :initarg :name :reader s-name)
-     (type :initarg :type :reader s-type)
-     (element-type :initarg :element-type :reader s-element-type)
-     (dimensions :initarg :dimensions :initform 1 :reader s-dimensions)
-     (normalized :initarg :normalized :reader s-normalizedp)
-     (reader :initarg :reader :reader s-reader)
-     (writer :initarg :writer :reader s-writer)
-     (uses-method-p :initarg :uses-method-p :reader s-uses-method-p))))
+(defclass gl-struct-slot ()
+  ((name :initarg :name :reader s-name)
+   (type :initarg :type :reader s-type)
+   (element-type :initarg :element-type :reader s-element-type)
+   (dimensions :initarg :dimensions :initform 1 :reader s-dimensions)
+   (normalized :initarg :normalized :reader s-normalizedp)
+   (reader :initarg :reader :reader s-reader)
+   (writer :initarg :writer :reader s-writer)
+   (uses-method-p :initarg :uses-method-p :reader s-uses-method-p)
+   (layout :initarg :layout :reader s-layout)
+   (parent-ffi-name :initarg :parent-ffi-name :reader s-parent-ffi-name)))
+
+(defmethod make-load-form ((slot gl-struct-slot) &optional environment)
+  (declare (ignore environment))
+  (with-slots (name
+               type
+               element-type
+               dimensions
+               normalized
+               reader
+               writer
+               uses-method-p
+               layout
+               parent-ffi-name)
+      slot
+    `(make-instance 'gl-struct-slot
+                    :name ',name
+                    :type ',type
+                    :normalized ',normalized
+                    :reader ',reader
+                    :writer ',writer
+                    :element-type ',element-type
+                    :dimensions ',dimensions
+                    :layout ',layout
+                    :parent-ffi-name ',parent-ffi-name)))
 
 (defmethod s-arrayp ((object gl-struct-slot))
   (eq (s-type object) :array))
 
-(defmethod s-prim-p ((spec t))
-  (not (null (member spec cffi::*built-in-foreign-types*))))
-(defmethod s-extra-prim-p ((spec t))
-  (not (null (assoc spec cffi::*extra-primitive-types*))))
-
-(defmethod s-prim-p ((object gl-struct-slot))
-  (s-prim-p (s-type object)))
-(defmethod s-extra-prim-p ((object gl-struct-slot))
-  (s-extra-prim-p (s-type object)))
+(defmethod v-type-of ((gss gl-struct-slot))
+  (if (s-arrayp gss)
+      (type-spec->type (list (s-element-type gss) (s-dimensions gss)))
+      (type-spec->type (s-type gss))))
 
 (defmethod s-def ((object gl-struct-slot))
   (if (s-uses-method-p object)
       'defmethod
       'defun))
 
-
 (defmethod s-slot-args ((slot gl-struct-slot) (args list))
-    (labels ((fun-arg (x) (if (listp x) (first x) x)))
-      (if (s-uses-method-p slot)
-          args
-          (mapcar #'fun-arg args))))
+  (labels ((fun-arg (x) (if (listp x) (first x) x)))
+    (if (s-uses-method-p slot)
+        args
+        (mapcar #'fun-arg args))))
 
 ;;------------------------------------------------------------
-
 
 (defun+ nest-simple-loops (dimensions index-vars body &optional (loop-op :do))
   (labels ((inner (dimensions index-vars body loop-op)
@@ -62,74 +113,142 @@
                         loop-op))))
     (inner (reverse dimensions) (reverse index-vars) body loop-op)))
 
-(defun+ type->spec (type)
-  ;; Well this is janky, I guess this'll break at some point if we don't sort
-  ;; it before then.. what is odd is that it seems this is really just for
-  ;; getting a spec using the keyword names where it makes sense.
-  (let ((spec (type->type-spec type)))
-    (if (listp spec)
-        `(,(if (core-typep (type-spec->type (first spec)))
-               (kwd (subseq (symbol-name (first spec)) 2))
-               (first spec))
-           ;; When would this ↓↓↓↓-----↓↓↓↓ happen?
-           ,(if (and (listp (second spec))
-                     (= (length (second spec)) 1))
-                (first (second spec))
-                (second spec)))
-        (if (core-typep type)
-            (kwd (subseq (symbol-name spec) 2))
-            spec))))
+;;------------------------------------------------------------
+
+(defun assert-layout-consistent (g-struct-info target-layout)
+  (labels ((get-inconsistent-layout (slot)
+             (with-slots (type element-type) slot
+               (let ((type-info (cepl.types::g-struct-info
+                                 type :error-if-not-found nil))
+                     (elem-info (cepl.types::g-struct-info
+                                 element-type :error-if-not-found nil)))
+                 (or (when type-info
+                       (unless (string= (type-of (s-layout type-info))
+                                        target-layout)
+                         (list (s-name type-info)
+                               (type-of (s-layout type-info)))))
+                     (when elem-info
+                       (unless (string= (type-of (s-layout elem-info))
+                                        target-layout)
+                         (list (s-name elem-info)
+                               (type-of (s-layout elem-info))))))))))
+    (let* ((inconsistent-slots (mapcar #'get-inconsistent-layout
+                                       (s-slots g-struct-info)))
+           (inconsistent-slots (remove nil inconsistent-slots)))
+      (assert (not inconsistent-slots) ()
+              'inconsistent-struct-layout
+              :name (s-name g-struct-info)
+              :target target-layout
+              :slots inconsistent-slots)
+      t)))
 
 ;;------------------------------------------------------------
 
-;;{TODO} Autowrap-name is name now...can clean up lots of code
+(defun potential-struct-layout (name layout-specifier slot-descriptions)
+  (unless (string= layout-specifier :default)
+    (calc-struct-layout-from-name-type-pairs
+     layout-specifier
+     name
+     (mapcar (lambda (x)
+               (dbind (name type &rest rest) x
+                 (declare (ignore rest))
+                 (list name (type-spec->type type))))
+             slot-descriptions))))
+
 (defmacro defstruct-g (name-and-options &body slot-descriptions)
-  (dbind (name &key (accesors t) (constructor (symb 'make- name))
-               (readers t) (writers t) (pull-push t) (attribs t) (populate t))
+  (dbind (name &key (accessors t) (constructor (symb 'make- name))
+               (readers t) (writers t) (pull-push t) (attribs t) (populate t)
+               (layout :default))
       (listify name-and-options)
-    (let ((slots (mapcar (lambda (_) (normalize-slot-description
-                                      _ name (and readers accesors)
-                                      (and writers accesors)))
-                         slot-descriptions)))
+    (let* (;; names
+           (foreign-struct-name (hidden-symb name :foreign))
+           (qualified-struct-name `(:struct ,foreign-struct-name))
+           (typed-populate (symb :populate- name))
+           (wrapper-constructor-name (hidden-symb name :make))
+           ;; slots
+           (layout-specifier layout)
+           (layout (potential-struct-layout name
+                                            layout-specifier
+                                            slot-descriptions))
+           (slot-layouts (if layout
+                             (layout-members layout)
+                             (n-of nil (length slot-descriptions))))
+           (slots (mapcar (lambda (desc layout)
+                            (normalize-slot-description qualified-struct-name
+                                                        desc
+                                                        layout
+                                                        name
+                                                        (and readers accessors)
+                             (and writers accessors)))
+                          slot-descriptions
+                          slot-layouts))
+           (struct-info (make-instance 'cepl-struct-definition
+                                       :name name
+                                       :foreign-name foreign-struct-name
+                                       :layout layout
+                                       :slots slots)))
+      (assert (= (length slot-layouts) (length slots)))
       (when (validate-defstruct-g-form name slots)
+        (setf (g-struct-info name) struct-info)
+        (assert-layout-consistent struct-info layout-specifier)
         `(progn
-           (eval-when (:compile-toplevel :load-toplevel :execute)
-             ,@(make-autowrap-record-def name slots))
-           (autowrap:define-wrapper* (:struct (,name)) ,name
-             :constructor ,(symb '%make- name))
+           (setf (g-struct-info ',name) ',struct-info)
            (eval-when (:compile-toplevel :load-toplevel :execute)
              ,(make-varjo-struct-def name slots))
-           ,(make-varjo-struct-lookup name)
-           ,@(when (and readers accesors)
-                   (remove nil (mapcar (lambda (_)
-                                         (make-slot-getter _ name))
-                                       slots)))
-           ,@(when (and writers accesors)
-                   (remove nil (mapcar (lambda (_)
-                                         (make-slot-setter _ name name))
-                                       slots)))
-           ,(when constructor (make-make-struct constructor name slots))
+           ,@(make-instance-wrapper-def name
+                                        foreign-struct-name
+                                        wrapper-constructor-name
+                                        slots typed-populate slot-layouts)
+           ,@(when (and readers accessors)
+               (remove nil (mapcar (lambda (slot slot-layout)
+                                     (make-slot-getter slot name
+                                                       qualified-struct-name
+                                                       slot-layout))
+                                   slots
+                                   slot-layouts)))
+           ,@(when (and writers accessors)
+               (remove nil (mapcar (lambda (slot slot-layout)
+                                     (make-slot-setter slot name
+                                                       qualified-struct-name
+                                                       slot-layout))
+                                   slots
+                                   slot-layouts)))
+           ,(when constructor (make-make-struct constructor
+                                                wrapper-constructor-name
+                                                name
+                                                slots))
            ,(when attribs (make-struct-attrib-assigner name slots))
+           ,@(when populate (make-populate name typed-populate slots))
            ,(make-struct-pixel-format name slots)
-           ,@(when populate (make-populate name slots name))
-           ,@(make-foreign-conversions name)
            ,@(when pull-push (make-pull-push name slots))
+           ,(make-varjo-struct-lookup name)
            ',name)))))
 
-(defun+ normalize-slot-description (slot-description type-name readers writers)
+(defun+ normalize-slot-description (qualified-struct-name
+                                    slot-description
+                                    slot-layout
+                                    type-name
+                                    readers
+                                    writers)
   (destructuring-bind (name type &key normalized accessor) slot-description
     (let* ((type (listify type))
            (dimensions (listify (or (second type) 1)))
            (arrayp (> (first dimensions) 1))
            (element-type (when arrayp (first type)))
            (type (if arrayp :array (first type))))
-      (make-instance 'gl-struct-slot :name name :type type :normalized normalized
+      (make-instance 'gl-struct-slot
+                     :name name
+                     :type type
+                     :normalized normalized
                      :reader (when readers
                                (or accessor (symb type-name '- name)))
                      :writer (when writers
                                (or accessor (symb type-name '- name)))
                      :uses-method-p (not (null accessor))
-                     :element-type element-type :dimensions dimensions))))
+                     :element-type element-type
+                     :dimensions dimensions
+                     :layout slot-layout
+                     :parent-ffi-name qualified-struct-name))))
 
 ;; put all cepl's errors definitions in one place (like varjo)
 (defun+ validate-defstruct-g-form (name slots)
@@ -160,9 +279,9 @@
            ,@(when accessor `(:accessor ,accessor))))))
 
 (defun+ validate-varjo-type-spec (spec)
-  (let ((spec (or (cdr (assoc spec *cpu->gpu-vec-mappings*))
+  (let ((spec (or (cdr (assoc spec +cpu->gpu-vec-mappings+))
                   spec)))
-    (type->spec (type-spec->type spec))))
+    (type->type-spec (type-spec->type spec))))
 
 ;;------------------------------------------------------------
 
@@ -172,141 +291,180 @@
 
 ;;------------------------------------------------------------
 
-(defun+ make-autowrap-record-def (name slots)
-  (let ((slot-defs (mapcar #'format-slot-for-autowrap slots)))
-    (list
-     `(autowrap:define-foreign-record
-          ',name
-          :struct
-        ,(loop :for i :in slot-defs :summing (nth (1+ (position :bit-size i)) i))
-        8
-        ',(loop :for i :in slot-defs :with offset = 0
-             :collect (subst offset :-offset- i)
-             :do (incf offset (nth (1+ (position :bit-size i)) i))))
-     `(autowrap:define-foreign-alias ',name '(:struct (,name))))))
+(defstruct (base-gstruct-wrapper (:copier nil))
+  (pointer (null-pointer) :type foreign-pointer))
 
-(defun+ format-slot-for-autowrap (slot)
+(defmethod cepl.c-arrays:pointer ((wrapper base-gstruct-wrapper))
+  (base-gstruct-wrapper-pointer wrapper))
+
+(defmethod free ((wrapper base-gstruct-wrapper))
+  (foreign-free (base-gstruct-wrapper-pointer wrapper)))
+
+(defun+ make-instance-wrapper-def (name
+                                   foreign-struct-name
+                                   wrapper-constructor-name
+                                    slots
+                                   typed-populate
+                                   slot-layouts)
+  (let* ((foreign-type-name (hidden-symb name :cffi-ct-type))
+         (slot-defs (mapcar #'format-slot-for-cstruct
+                            slots
+                            slot-layouts))
+         ;;
+         (from (hidden-symb name :from-foreign))
+         (to (hidden-symb name :to-foreign)))
+    `((eval-when (:compile-toplevel :load-toplevel :execute)
+        (defcstruct ,foreign-struct-name
+          ,@slot-defs)
+
+        (define-foreign-type ,foreign-type-name nil nil
+                             (:actual-type :struct ,foreign-struct-name)
+                             (:simple-parser ,name))
+
+        (defmethod translate-from-foreign (ptr (type ,foreign-type-name))
+          (,wrapper-constructor-name ptr))
+
+        (defmethod expand-from-foreign (ptr (type ,foreign-type-name))
+          (list ',wrapper-constructor-name ptr)))
+
+      (defstruct (,name (:include base-gstruct-wrapper)
+                        (:constructor ,wrapper-constructor-name (pointer))
+                        (:copier nil)))
+
+      (defmethod print-object ((obj ,name) stream)
+        (format stream "#<~a {~x}>"
+                ',name
+                (cffi:pointer-address
+                 (base-gstruct-wrapper-pointer obj))))
+
+      (defn-inline ,from ((ptr foreign-pointer)) ,name
+        (declare (optimize (speed 3) (safety 0) (debug 0)))
+        (,wrapper-constructor-name ptr))
+
+      (defn-inline ,to ((ptr foreign-pointer) (value t)) t
+        (declare (optimize (speed 3) (safety 0) (debug 0)))
+        (,typed-populate (,wrapper-constructor-name ptr) value))
+
+      (defmethod get-typed-from-foreign ((type-name (eql ',name)))
+        #',from)
+
+      (defmethod get-typed-to-foreign ((type-name (eql ',name)))
+        #',to))))
+
+(defun+ format-slot-for-cstruct (slot layout)
   (if (s-arrayp slot)
-      (format-array-slot-for-autowrap slot)
-      (%format-slot-for-autowrap slot)))
+      (format-array-slot-for-cstruct slot layout)
+      `(,(s-name slot)
+         ,(s-type slot)
+         ,@(when layout `(:offset ,(layout-aligned-offset layout))))))
 
-(defun+ %format-slot-for-autowrap (slot)
-  (let* ((s-type (if (assoc (s-type slot) cffi::*extra-primitive-types*)
-                     (symb-package :cffi :cepl- (s-type slot))
-                     (s-type slot)))
-         (a-type (autowrap:find-type s-type)))
-    (list (kwd (s-name slot))
-          (s-type slot)
-          :bit-size (* 8 (autowrap:foreign-type-size a-type))
-          :bit-offset :-offset-
-          :bit-alignment 8)))
-
-(defun+ format-array-slot-for-autowrap (slot)
+(defun+ format-array-slot-for-cstruct (slot layout)
   (when (> (length (s-dimensions slot)) 1)
-    (error "Cannot currently support multi dimensional autowrap arrays"))
-  (let* ((e-type (if (assoc (s-element-type slot) cffi::*extra-primitive-types*)
-                     (symb-package :cffi :cepl- (s-element-type slot))
-                     (s-element-type slot)))
-         (a-type (autowrap:find-type e-type)))
-    (list (kwd (s-name slot))
-          `(:array ,(s-element-type slot) ,(reduce #'* (s-dimensions slot)))
-          :bit-size (* (autowrap:foreign-type-size a-type)
-                       (reduce #'* (s-dimensions slot))
-                       8)
-          :bit-offset :-offset-
-          :bit-alignment 8)))
+    (error "Cannot currently support multi dimensional arrays"))
+  ;; As we cant encode stride in defcstruct we instead make a byte array of
+  ;; the correct size and rely on c-array to handle the stride correctly.
+  (if layout
+      `(,(s-name slot)
+         (:array :uint8 ,(layout-machine-unit-size layout))
+         :offset ,(layout-base-offset layout))
+      `(,(s-name slot)
+         (:array ,(s-element-type slot) ,(reduce #'* (s-dimensions slot))))))
 
 ;;{TODO} should be setting fields here
-(defun+ make-make-struct (constructor-name awrap-type-name slots)
+(defun+ make-make-struct (constructor-name
+                          wrapper-constructor-name
+                          awrap-type-name
+                          slots)
   (let ((vars (loop :for s :in slots :collect (s-name s))))
     `(defun+ ,constructor-name ,(cons '&key vars)
-       (let ((result (autowrap:alloc ',awrap-type-name)))
+       (let ((result (,wrapper-constructor-name
+                      (foreign-alloc ',awrap-type-name))))
          ,@(loop :for s :in slots :for v :in vars :collect
               `(when ,v (setf (,(s-writer s) result) ,v)))
          result))))
 
 ;;------------------------------------------------------------
 
-(defun+ make-slot-getter (slot type-name)
+(defun+ make-slot-getter (slot type-name foreign-struct-name layout)
   (when (s-reader slot)
     (cond
-      ((member (s-type slot) cffi:*built-in-foreign-types*)
-       (make-prim-slot-getter slot type-name))
-      ((assoc (s-type slot) cffi::*extra-primitive-types*)
-       (make-eprim-slot-getter slot type-name))
-      ((not (s-arrayp slot)) (make-t-slot-getter slot type-name))
-      ((s-arrayp slot) (make-array-slot-getter slot type-name))
+      ((not (s-arrayp slot)) (make-t-slot-getter
+                              slot type-name foreign-struct-name))
+      ((s-arrayp slot) (make-array-slot-getter
+                        slot type-name foreign-struct-name layout))
       (t (error "Dont know what to do with slot ~a" slot)))))
 
-(defun+ make-prim-slot-getter (slot awrap-type-name)
+(defun+ make-t-slot-getter (slot type-name foreign-struct-name)
   `(,(s-def slot) ,(s-reader slot)
-     ,(s-slot-args slot `((wrapped-object ,awrap-type-name)))
-     (plus-c:c-ref wrapped-object ,awrap-type-name ,(kwd (s-name slot)))))
+     ,(s-slot-args slot `((wrapped-object ,type-name)))
+     (foreign-slot-value (base-gstruct-wrapper-pointer wrapped-object)
+                         ',foreign-struct-name
+                         ',(s-name slot))))
 
-(defun+ make-eprim-slot-getter (slot awrap-type-name)
+(defun+ make-array-slot-getter (slot type-name foreign-struct-name layout)
   `(,(s-def slot) ,(s-reader slot)
-     ,(s-slot-args slot `((wrapped-object ,awrap-type-name)))
-     (mem-ref (plus-c:c-ref wrapped-object ,awrap-type-name
-                            ,(kwd (s-name slot)) plus-c::&)
-              ,(s-type slot))))
+     ,(s-slot-args slot `((wrapped-object ,type-name)))
+     (cepl.c-arrays::make-c-array-from-pointer
+      ',(s-dimensions slot) ',(s-element-type slot)
+      (foreign-slot-pointer (base-gstruct-wrapper-pointer
+                             wrapped-object)
+                            ',foreign-struct-name
+                            ',(s-name slot))
+      ,@(when layout `(:element-byte-size
+                       ,(layout-machine-unit-size
+                         (layout-element-layout layout)))))))
 
-(defun+ make-t-slot-getter (slot awrap-type-name)
-  `(,(s-def slot) ,(s-reader slot)
-     ,(s-slot-args slot `((wrapped-object ,awrap-type-name)))
-     (plus-c:c-ref wrapped-object ,awrap-type-name
-                   ,(kwd (s-name slot)))))
-
-(defun+ make-array-slot-getter (slot awrap-type-name)
-  `(,(s-def slot) ,(s-reader slot)
-     ,(s-slot-args slot `((wrapped-object ,awrap-type-name)))
-     (cepl.c-arrays::make-c-array-from-pointer ',(s-dimensions slot) ,(s-element-type slot)
-                                               (plus-c:c-ref wrapped-object ,awrap-type-name
-                                                             ,(kwd (s-name slot)) plus-c::&))))
-
-(defun+ make-slot-setter (slot type-name awrap-type-name)
+(defun+ make-slot-setter (slot type-name foreign-struct-name layout)
   (when (s-writer slot)
     (cond
-      ((member (s-type slot) cffi:*built-in-foreign-types*)
-       (make-prim-slot-setter slot awrap-type-name))
-      ((assoc (s-type slot) cffi::*extra-primitive-types*)
-       (make-eprim-slot-setter slot awrap-type-name))
-      ((not (s-arrayp slot)) (make-t-slot-setter slot awrap-type-name))
-      ((s-arrayp slot) (make-array-slot-setter slot type-name awrap-type-name))
+      ((or (member (s-type slot) cffi:*built-in-foreign-types*)
+           (member (s-type slot) '(:uint))
+           (assoc (s-type slot) cffi::*extra-primitive-types*))
+       (make-eprim-slot-setter slot type-name foreign-struct-name layout))
+      ((not (s-arrayp slot))
+       (make-t-slot-setter slot type-name layout))
+      ((s-arrayp slot)
+       (make-array-slot-setter slot type-name layout))
       (t (error "Dont know what to do with slot ~a" slot)))))
 
-(defun+ make-prim-slot-setter (slot awrap-type-name)
+(defun+ make-eprim-slot-setter (slot
+                                type-name
+                                foreign-struct-name
+                                layout)
+  (declare (ignore layout))
   `(,(s-def slot) (setf ,(s-writer slot))
-     ,(s-slot-args slot `(value (wrapped-object ,awrap-type-name)))
-     (setf (plus-c:c-ref wrapped-object ,awrap-type-name ,(kwd (s-name slot)))
+     ,(s-slot-args slot `(value (wrapped-object ,type-name)))
+     (setf (mem-ref (foreign-slot-pointer (base-gstruct-wrapper-pointer
+                                           wrapped-object)
+                                          ',foreign-struct-name
+                                          ',(s-name slot))
+                    ,(s-type slot))
            value)))
 
-(defun+ make-eprim-slot-setter (slot awrap-type-name)
+(defun+ make-t-slot-setter (slot type-name layout)
+  (declare (ignore layout))
   `(,(s-def slot) (setf ,(s-writer slot))
-     ,(s-slot-args slot `(value (wrapped-object ,awrap-type-name)))
-     (let ((ptr (plus-c:c-ref wrapped-object ,awrap-type-name
-                              ,(kwd (s-name slot)) plus-c::&)))
-       (setf (mem-ref ptr ,(s-type slot)) value))))
-
-(defun+ make-t-slot-setter (slot awrap-type-name)
-  `(,(s-def slot) (setf ,(s-writer slot))
-     ,(s-slot-args slot `((value list) (wrapped-object ,awrap-type-name)))
+     ,(s-slot-args slot `((value list) (wrapped-object ,type-name)))
      (cepl.internals:populate (,(s-reader slot) wrapped-object) value)))
 
-(defun+ make-array-slot-setter (slot type-name awrap-type-name)
-  (declare (ignore type-name))
+(defun+ make-array-slot-setter (slot type-name layout)
+  (declare (ignore layout))
   `(,(s-def slot) (setf ,(s-writer slot))
-     ,(s-slot-args slot `((value list) (wrapped-object ,awrap-type-name)))
-     (cepl.c-arrays::c-populate (,(s-reader slot) wrapped-object) value)))
+     ,(s-slot-args slot `((value list) (wrapped-object ,type-name)))
+     (cepl.c-arrays::copy-lisp-data-to-c-array
+      (,(s-reader slot) wrapped-object)
+      value)))
 
 ;;------------------------------------------------------------
 
-(defun+ buffer-stream-comptible-typep (slot)
-  (let* ((type-spec (s-type slot)))
-    (or (not (null (cdr (assoc type-spec *cpu->gpu-vec-mappings*))))
-        (core-typep (type-spec->type type-spec)))))
+(defun+ buffer-stream-compatible-typep (slot)
+  (when (not (s-arrayp slot))
+    (let* ((type-spec (s-type slot)))
+      (or (not (null (cdr (assoc type-spec +cpu->gpu-vec-mappings+))))
+          (core-typep (type-spec->type type-spec))))))
 
 (defun+ make-struct-attrib-assigner (type-name slots)
-  (when (every #'buffer-stream-comptible-typep slots)
+  (when (every #'buffer-stream-compatible-typep slots)
     (let* ((stride (if (> (length slots) 1)
                        `(cepl.internals:gl-type-size ',type-name)
                        0))
@@ -340,10 +498,10 @@
                ,(length def-sets))))))))
 
 (defun+ expand-slot-to-layout (slot &optional type normalize)
-  ;; if it one of the types in *cpu->gpu-vec-mappings* then it is one
+  ;; if it one of the types in +cpu->gpu-vec-mappings+ then it is one
   ;; where the gpu side type will be different from the cpu-side one
   ;; this means we cant rely on the varjo type introspection
-  (if (and (not type) (assoc (s-type slot) *cpu->gpu-vec-mappings*))
+  (if (and (not type) (assoc (s-type slot) +cpu->gpu-vec-mappings+))
       (expand-unmappable-slot-to-layout slot type normalize)
       (expand-mappable-slot-to-layout slot type normalize)))
 
@@ -369,7 +527,7 @@
           ;;
           ((v-typep type 'v-vector)
            (list (list (apply #'* (v-dimensions type))
-                       (type->spec (v-element-type type))
+                       (type->type-spec (v-element-type type))
                        normalize)))
           ;;
           ((v-typep type 'v-array)
@@ -377,57 +535,34 @@
               :append (expand-mappable-slot-to-layout
                        nil (v-element-type type) normalize)))
           ;;
-          (t `((1 ,(type->spec type) ,normalize))))))
+          (t `((1 ,(type->type-spec type) ,normalize))))))
 
 ;;------------------------------------------------------------
 
-(defun+ make-pull-push (autowrap-name slots)
-  `((defmethod pull-g ((object ,autowrap-name))
-      (list
-       ,@(loop :for slot :in slots :for i :from 0 :collect
-            `(,(s-writer slot) object))))
-    (defmethod pull1-g ((object ,autowrap-name))
-      (list
-       ,@(loop :for slot :in slots :for i :from 0 :collect
-            `(,(s-writer slot) object))))
-    (defmethod push-g ((object list) (destination ,autowrap-name))
-      (cepl.internals:populate destination object))))
+(defun+ make-pull-push (name slots)
+  (let ((pull-body `(list
+                     ,@(loop :for slot :in slots :for i :from 0 :collect
+                          (if (s-arrayp slot)
+                              `(pull-g (,(s-reader slot) object))
+                              `(,(s-reader slot) object))))))
+    `((defmethod pull-g ((object ,name)) ,pull-body)
+      (defmethod pull1-g ((object ,name)) ,pull-body)
+      (defmethod push-g ((object list) (destination ,name))
+        (cepl.internals:populate destination object)))))
 
 ;;------------------------------------------------------------
 
-(defun+ make-populate (autowrap-name slots struct-name)
-  (let ((typed-name (symb :populate- struct-name)))
-    `((defun+ ,typed-name (object data)
-        (declare (type ,autowrap-name object))
-        (unless (or (vectorp data) (listp data))
-          (error "can only populate a struct of type ~a with a list or an array"
-                 ',autowrap-name))
-        ,@(loop :for slot :in slots :for i :from 0 :collect
-             `(setf (,(s-writer slot) object) (elt data ,i)))
-        object)
-      (defmethod cepl.internals:populate ((object ,autowrap-name) data)
-          (,typed-name object data)))))
-
-;;------------------------------------------------------------
-
-(defun+ make-foreign-conversions (type)
-  (let* ((from (cepl-utils:symb type '-from-foreign))
-         (to (cepl-utils:symb type '-to-foreign))
-         (typed-populate (symb :populate- type)))
-    `((declaim (inline ,from))
-      (declaim (inline ,to))
-      (defun ,from (ptr)
-        (declare (type cffi:foreign-pointer ptr)
-                 (optimize (speed 3) (safety 0) (debug 0)))
-        (autowrap:wrap-pointer ptr ',type))
-      (defun ,to (ptr value)
-        (declare (type cffi:foreign-pointer ptr)
-                 (optimize (speed 3) (safety 0) (debug 0)))
-        (,typed-populate (autowrap:wrap-pointer ptr ',type) value))
-      (defmethod get-typed-from-foreign ((type-name (eql ',type)))
-        #',from)
-      (defmethod get-typed-to-foreign ((type-name (eql ',type)))
-        #',to))))
+(defun+ make-populate (name typed-populate slots)
+  `((defun+ ,typed-populate (object data)
+      (declare (type ,name object))
+      (unless (or (vectorp data) (listp data))
+        (error "can only populate a struct of type ~a with a list or an array"
+               ',name))
+      ,@(loop :for slot :in slots :for i :from 0 :collect
+           `(setf (,(s-writer slot) object) (elt data ,i)))
+      object)
+    (defmethod cepl.internals:populate ((object ,name) data)
+      (,typed-populate object data))))
 
 ;;------------------------------------------------------------
 
@@ -444,3 +579,9 @@
              (cepl.pixel-formats::pixel-format! ,components ',type)))))))
 
 ;;------------------------------------------------------------
+
+;; (defmacro with-g-struct (type destructuring-form pointer &body body)
+;;   )
+
+;; (with-struct g-pnt (pos (norm x z))
+;;   (* pos x z))

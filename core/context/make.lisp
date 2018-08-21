@@ -8,8 +8,11 @@
         (make-array (gl:get* :max-combined-texture-image-units)
                     :element-type '(or null sampler)
                     :initial-element nil))
-
-  (let ((len (gl:get* :max-draw-buffers)))
+  ;;
+  (let ((len (coerce (gl:get* :max-draw-buffers)
+                     '(unsigned-byte 16))))
+    (setf (%cepl-context-max-draw-buffer-count cepl-context)
+          len)
     (setf (%cepl-context-color-masks cepl-context)
           (make-array len :element-type '(simple-array boolean (4))
                       :initial-contents
@@ -30,7 +33,7 @@
   (setf (depth-mask cepl-context) t)
   ;; Set the default depth range
   (setf (depth-range-vec2 cepl-context)
-        (v! 0 1))
+        (vec2 0f0 1f0))
   ;; Enable the depth clamp
   (setf (depth-clamp cepl-context)
         t)
@@ -42,20 +45,11 @@
         :ccw)
   ;; Default clear color
   (setf (clear-color cepl-context)
-        (v! 0 0 0 0)))
+        (vec4 0f0 0f0 0f0 0f0))
+  ;; Default row-alignments
+  (setf (unpack-alignment t) 4)
+  (setf (pack-alignment t) 4)
+  ;; Done :)
+  t)
 
 ;;----------------------------------------------------------------------
-
-(defgeneric on-host-initialized (context)
-  (:method ((context cepl-context))
-    (unless (initialized-p context)
-      (when (remove context *contexts*)
-        (assert (cepl.host:supports-multiple-contexts-p) ()
-                "CEPL: Sorry your current CEPL host does not currently support multiple contexts"))
-      ;; make the surfaces
-      (init-pending-surfaces context)
-      ;;
-      (when (surfaces context)
-        (make-surface-current context (first (surfaces context))))
-      ;;
-      context)))

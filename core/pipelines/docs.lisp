@@ -9,14 +9,16 @@ Commonly refered to in CEPL as a 'gpu function' or 'gfunc'
 Gpu functions try to feel similar to regular CL functions however naturally
 there are some differences.
 
-The first and most obvious one is that whilst gpu function can be called
-from other gpu functions, they cannot be called from lisp functions directly.
-They first must be composed into a pipeline using `defpipeline-g`.
+The first and most obvious one is that gpu function should only be called
+from other gpu functions and/or composed into a pipeline using `defpipeline-g`.
 
-When a gfunc is composed into a pipeline then that function takes on the role of
-one of the 'shader stages' of the pipeline. For a proper breakdown of pipelines
-see the docstring for defpipeline-g.
+Whilst it is actually possible to call on from a lisp function this is provided
+solely for making interactive development and debugging easier. Please see the
+`EXPERIMENTAL` section below for more info
 
+When a gfunc is composed into a pipeline then that function takes on the role
+of one of the 'shader stages' of the pipeline. For a proper breakdown of
+pipelines see the docstring for defpipeline-g.
 
 Let's see a simple example of a gpu function we can then break down
 
@@ -53,6 +55,48 @@ Let's see a simple example of a gpu function we can then break down
 
 That's the basics of gpu-functions. For more details on how they can be used
 in pipelines please see the documentation for defpipeline-g.
+
+*More Argument Kinds*
+
+Along with `&uniform` there are also `&shared` & `&context`.
+
+`&context` specifies restrictions on how & where the gpu-function can be used. You
+can specify what versions of GLSL this function is valid for, what primtive kind it
+operates on, what pipeline stage it can be used for, and how CEPL compiles the cpu
+side representation.
+
+For more info please see the documentation on `compile-context`
+
+`&shared` is only valid for gpu-functions which will be used as compute stages
+It lets you specify variables whos data will be shared within the 'local group'
+You can use any non opaque type for the shared variable.
+
+*EXPRERIMENTAL*
+
+CEPL has a highly experimental feature to allow you to call gpu-functions directly
+What it aims to allow you to do is to generate and run a pipeline which runs your
+function once with the given arguments on the GPU.
+
+By doing this it gives you a way to try out your gpu-functions from the REPL
+without having to make a pipeline map-g over it whilst use ssbos or
+transform-feedback to capture the result.
+
+Currently this only works with functions that would work within a vertex
+shader (so things like gl-frag-pos will not work) however we want to expand on
+this in the future.
+
+This is not intended to be used *anywhere* where performance matters, it was
+made solely as a debugging/development aid. Every time it is run it must:
+
+- generate a pipeline
+- compile it
+- map-g over it
+- marshal the results back to lisp
+- free the pipeline
+
+This is *extremly* expensive, however as long as it takes less that 20ms or so
+it is fast enough for use from the repl.
+
 ")
 
   (defmacro defun-g-equiv
@@ -117,153 +161,21 @@ Let's see a simple example of a gpu function we can then break down
 
 That's the basics of gpu-functions. For more details on how they can be used
 in pipelines please see the documentation for defpipeline-g.
-")
 
-  (defmacro def-g->
-      "
-__WIP__ def-g-> is the old name for `defpipeline-g`. def-g-> is deprecated and will
-        be removed December 2017.
-        defpipeline-g does EXACTLY the same thing as def-g->
+*More Argument Kinds*
 
+Along with `&uniform` there are also `&shared` & `&context`.
 
-def-g-> (or defpipeline-g) is how we define named rendering pipelines in CEPL.
+`&context` specifies restrictions on how & where the gpu-function can be used. You
+can specify what versions of GLSL this function is valid for, what primtive kind it
+operates on, what pipeline stage it can be used for, and how CEPL compiles the cpu
+side representation.
 
-Rendering pipelines are constructed by composing gpu-functions.
+For more info please see the documentation on `compile-context`
 
-Rendering in OpenGL is descibed as a pipeline where a `buffer-stream` of data
-usually describing geometry) is mapped over whilst a number of uniforms are
-available as input and the outputs are written into an `FBO`.
-
-There are many stages to the pipeline and a full explanation of the GPU pipeline
-is beyond the scope of this docstring. However it surfices to say that only
-5 stages are fully programmable (and a few more customizable).
-
-def-g-> lets you specify the code (shaders) to run the programmable
-parts (stages) of the pipeline.
-
-The available stages kinds are:
-
-- :vertex
-- :tessellation-control
-- :tessellation-evaluation
-- :geometry
-- :fragment
-
-To define code that runs on the gpu in CEPL we use gpu functions (gfuncs). Which
-are defined with defun-g.
-
-Here is an example pipeline:
-
-    (defun-g vert ((position :vec4) &uniform (i :float))
-      (values position (sin i) (cos i)))
-
-    (defun-g frag ((s :float) (c :float))
-      (v! s c 0.4 1.0))
-
-    (def-g-> prog-1 ()
-      (vert :vec4)
-      (frag :float :float))
-
-Here we define a pipeline #'prog-1 which uses the gfunc vert as its vertex
-shader and used the gfunc frag as the fragment shader.
-
-It is also possible to specify the name of the stages
-
-    (def-g-> prog-1 ()
-      :vertex (vert :vec4)
-      :fragment (frag :float :float))
-
-But this is not neccesary unless you need to distinguish between tessellation
-or geometry stages.
-
-**-- Context --**
-
-The second argument to def-g-> is the a list of additional information that is
-confusingly called the 'pipeline's context'. We need to change this name.
-
-Valid things that can be in this list are:
-
-*A primitive type:*
-
-This specifies what primitives can be passed into this pipeline.
-By default all pipelines expect triangles. When you map a `buffer-stream` over a
-pipeline the primitive kind of the stream must match the pipeline.
-
-The valid values are:
-
-    :dynamic
-    :points
-    :lines :line-loop :line-strip
-    :lines-adjacency :line-strip-adjacency
-    :triangles :triangle-fan :triangle-strip
-    :triangles-adjacency :triangle-strip-adjacency
-    (:patch <patch-size>)
-
-:dynamic is special, it means that the pipeline will take the primitive kind
-from the buffer-stream being mapped over. This won't work for with pipelines
-with geometry or tessellation stages, but it otherwise quite useful.
-
-*A version restriction:*
-
-This tells CEPL to compile the stage for a specific
-version of GLSL. You usually do not want to use this as CEPL will compile for
-the version the user is using.
-
-The value can be one of:
-
-    :140 :150 :330 :400 :410 :420 :430 :440 :450
-
-**-- Stage Names --**
-
-Notice that we have to specify the typed signature of the stage. This is because
-CEPL allows you to 'overload' gpu functions. The signature for the a
-gpu-function is a list which starts with the function name and whose other
-elements are the types of the non-uniforms arguments. As an example we can see
-above that the signature for vert is (vert :vec4), not (vert :vec4 :float).
-
-**-- Passing values from Stage to Stage --**
-
-The return values of the gpu functions that are used as stages are passed as the
-input arguments of the next. The exception to this rule is that the first return
-value from the vertex stage is taken and used by GL, so only the subsequent
-values are passed along.
-
-We can see this in the example above: #'vert returns 3 values but #'frag only
-receives 2.
-
-The values from the fragment stage are writen into the current FBO. This may be
-the default FBO, in which case you will likely see the result on the screen, or
-it may be a FBO of your own.
-
-By default GL only writed the fragment return value to the FBO. For handling
-multiple return values please see the docstring for `with-fbo-bound`.
-
-**-- Using our pipelines --**
-
-To call a pipeline we use the `map-g` macro (or one of its siblings
-`map-g-into`/`map-g-into*`). The doc-strings for those macros go into more details
-but the basics are that map-g maps a buffer-stream over our pipeline and the
-results of the pipeline are fed into the 'current' fbo.
-
-We pass our stream to map-g as the first argument after the pipeline, we then
-pass the uniforms in the same style as keyword arguments. For example let's see
-our prog-1 pipeline again:
-
-    (defun-g vert ((position :vec4) &uniform (i :float))
-      (values position (sin i) (cos i)))
-
-    (defun-g frag ((s :float) (c :float))
-      (v! s c 0.4 1.0))
-
-    (def-g-> prog-1 ()
-      (vert :vec4)
-      (frag :float :float))
-
-We can call this as follows:
-
-    (map-g #'prog-1 v4-stream :i game-time)
-
-
+`&shared` is only valid for gpu-functions which will be used as compute stages
+It lets you specify variables whos data will be shared within the 'local group'
+You can use any non opaque type for the shared variable.
 ")
 
   (defmacro defpipeline-g
@@ -290,6 +202,7 @@ The available stages kinds are:
 - :tessellation-evaluation
 - :geometry
 - :fragment
+- :compute
 
 To define code that runs on the gpu in CEPL we use gpu functions (gfuncs). Which
 are defined with `defun-g`.
@@ -318,10 +231,10 @@ It is also possible to specify the name of the stages
 But this is not neccesary unless you need to distinguish between tessellation
 or geometry stages.
 
-**-- Context --**
+**-- Compile Context --**
 
 The second argument to defpipeline-g is the a list of additional information that
-is confusingly called the 'pipeline's context'. We need to change this name.
+is confusingly called the 'pipeline's compile-context'.
 
 Valid things that can be in this list are:
 
@@ -353,7 +266,18 @@ the version the user is using.
 
 The value can be one of:
 
-    :140 :150 :330 :400 :410 :420 :430 :440 :450
+    :140 :150 :330 :400 :410 :420 :430 :440 :450 :460
+
+*The recompilation restriction*:
+
+By adding the symbol `:static` to the list you tell CEPL that this pipeline
+will not be recompiled again this session. This means CEPL will not automatically
+recompile it if one of the gpu-functions that make up it's stages are recompiled.
+
+It also allows CEPL to perform optimizations on the generated code that it couldnt
+usually due to expecting signature/type changes.
+
+For a dryer version of the above please see the documentation for `compile-context`.
 
 **-- Stage Names --**
 
@@ -626,161 +550,8 @@ Another difference is that, in the pipeline, the variable gl-instance-id will
 contain the index of which of the 1000 instances is currently being drawn.
 ")
 
-  (defmacro g->
-      "
-__WIP__ g-> is the old name for pipeline. g-> is deprecated and will
-        be removed December 2017.
-        pipeline does EXACTLY the same thing as g->
-
-__WARNING__ EXPERIMENTAL FEATURE
-
-g-> is how we define anonymous rendering pipelines in CEPL.
-
-Rendering pipelines are constructed by composing gpu-functions.
-
-Rendering in OpenGL is descibed as a pipeline where a `buffer-stream` of data
-usually describing geometry) is mapped over whilst a number of uniforms are
-available as input and the outputs are written into an `FBO`.
-
-There are many stages to the pipeline and a full explanation of the GPU
-pipeline is beyond the scope of this docstring. However it surfices to say that
-only 5 stages are fully programmable (and a few more customizable).
-
-g-> lets you specify the code (shaders) to run the programmable parts (stages)
-of the pipeline.
-
-The available stages kinds are:
-
-- :vertex
-- :tessellation-control
-- :tessellation-evaluation
-- :geometry
-- :fragment
-
-To define code that runs on the gpu in CEPL we use gpu functions (gfuncs)
-Which are defined with `defun-g` or lambda-g.
-
-Here is an example pipeline:
-
-    (defun-g vert ((position :vec4) &uniform (i :float))
-      (values position (sin i) (cos i)))
-
-    (defun-g frag ((s :float) (c :float))
-      (v! s c 0.4 1.0))
-
-    (defun make-lambda-pipeline ()
-      (g-> ()
-        (vert :vec4)
-        (frag :float :float)))
-
-Here we define a lambda pipeline which uses the gfunc vert as its vertex
-shader and used the gfunc frag as the fragment shader.
-
-It is also possible to specify the name of the stages
-
-    (defun make-lambda-pipeline ()
-      (g-> ()
-        :vertex (vert :vec4)
-        :fragment (frag :float :float)))
-
-But this is not neccesary unless you need to distinguish between tessellation
-or geometry stages.
-
-**-- Context --**
-
-The first argument to g-> is the a list of additional information that is
-confusingly called the 'pipeline's context'. We need to change this name.
-
-Valid things that can be in this list are:
-
-*A primitive type:*
-
-This specifies what primitives can be passed into this pipeline.
-By default all pipelines expect triangles. When you map a buffer-stream over a
-pipeline the primitive kind of the stream must match the pipeline.
-
-The valid values are:
-
-    :dynamic
-    :points
-    :lines :line-loop :line-strip
-    :lines-adjacency :line-strip-adjacency
-    :triangles :triangle-fan :triangle-strip
-    :triangles-adjacency :triangle-strip-adjacency
-    (:patch <patch-size>)
-
-:dynamic is special, it means that the pipeline will take the primitive kind
-from the buffer-stream being mapped over. This won't work for with pipelines
-with geometry or tessellation stages, but it otherwise quite useful.
-
-*A version restriction:*
-
-This tells CEPL to compile the stage for a specific
-version of GLSL. You usually do not want to use this as CEPL will compile for
-the version the user is using.
-
-The value can be one of:
-
-    :140 :150 :330 :400 :410 :420 :430 :440 :450
-
-**-- Stage Names --**
-
-Notice that we have to specify the typed signature of the stage. This is because
-CEPL allows you to 'overload' gpu functions. The signature for the a
-gpu-function is a list which starts with the function name and whose other
-elements are the types of the non-uniforms arguments. As an example we can see
-above that the signature for vert is (vert :vec4), not (vert :vec4 :float).
-
-**-- Passing values from Stage to Stage --**
-
-The return values of the gpu functions that are used as stages are passed as the
-input arguments of the next. The exception to this rule is that the first return
-value from the vertex stage is taken and used by GL, so only the subsequent
-values are passed along.
-
-We can see this in the example above: #'vert returns 3 values but #'frag only
-receives 2.
-
-The values from the fragment stage are writen into the current FBO. This may be
-the default FBO, in which case you will likely see the result on the screen, or
-it may be a FBO of your own.
-
-By default GL only writed the fragment return value to the FBO. For handling
-multiple return values please see the docstring for `with-fbo-bound`.
-
-**-- Using our pipelines --**
-
-To call a pipeline we use the `map-g` macro (or one of its siblings
-`map-g-into`/`map-g-into*`). The doc-strings for those macros go into more details
-but the basics are that map-g maps a buffer-stream over our pipeline and the
-results of the pipeline are fed into the 'current' fbo.
-
-We pass our stream to map-g as the first argument after the pipeline, we then
-pass the uniforms in the same style as keyword arguments. For example let's see
-our lambda pipeline example again:
-
-    (defun-g vert ((position :vec4) &uniform (i :float))
-      (values position (sin i) (cos i)))
-
-    (defun-g frag ((s :float) (c :float))
-      (v! s c 0.4 1.0))
-
-    (defun make-lambda-pipeline ()
-      (g-> ()
-        (vert :vec4)
-        (frag :float :float)))
-
-We can call this as follows:
-
-    (setf some-var (make-lambda-pipeline))
-
-    (map-g some-var v4-stream :i game-time)
-")
-
   (defmacro pipeline-g
       "
-__WARNING__ EXPERIMENTAL FEATURE
-
 pipeline is how we define anonymous rendering pipelines in CEPL.
 
 Rendering pipelines are constructed by composing gpu-functions.
@@ -803,6 +574,7 @@ The available stages kinds are:
 - :tessellation-evaluation
 - :geometry
 - :fragment
+- :compute
 
 To define code that runs on the gpu in CEPL we use gpu functions (gfuncs)
 Which are defined with `defun-g` or lambda-g.
@@ -868,7 +640,7 @@ the version the user is using.
 
 The value can be one of:
 
-    :140 :150 :330 :400 :410 :420 :430 :440 :450
+    :140 :150 :330 :400 :410 :420 :430 :440 :450 :460
 
 **-- Stage Names --**
 
@@ -1029,58 +801,191 @@ That's the basics of gpu-functions. For more details on how they can be used
 in pipelines please see the documentation for defpipeline-g.
 ")
 
-    (defmacro glambda
+  (defun compile-g
       "
-__WIP__ glambda is the old name for lambda-g. glambda is deprecated and will
-        be removed December 2017.
-        lambda-g does EXACTLY the same thing as glambda
+This function takes a lambda-g form and compiles it to a gpu-lambda object.
 
-glambda let's you define an anonymous function which can run on the gpu.
-Commonly refered to in CEPL as a 'gpu function' or 'gfunc'
+This is used for similar reasons to `compile` in Common Lisp, you have a
+lambda definition as lists and you want a compiled lambda.
 
-Gpu functions try to feel similar to regular CL functions however naturally
-there are some differences.
+The result of this function is suitable for passing to pipeline-g which lets
+you define a map-g'able pipeline at runtime.
 
-The first and most obvious one is that whilst gpu function can be called
-from other gpu functions, they cannot be called from lisp functions directly.
-They first must be composed into a pipeline using `defpipeline-g`.
+Whilst this shares the same signature as CL's #'compile in our version the
+'name' argument must be nil.
+")
 
-When a gfunc is composed into a pipeline then that function takes on the role
-of one of the 'shader stages' of the pipeline. For a proper breakdown of
-pipelines see the docstring for defpipeline-g.
+  (defun free-pipeline
+      "
+This function takes a pipeline designator[0] and frees it, this releases
+frees the gl-program object.
 
-Let's see a simple example of a gpu function we can then break down
+[0] either a lambda-pipeline or a symbol naming a pipeline
+")
 
-    ;;       {0}       {3}        {1}           {2}
-    (glambda ((vert my-struct) &uniform (loop :float))
-      (values (v! (+ (my-struct-pos vert) ;; {4}
-                     (v! (sin loop) (cos loop) 0))
-                  1.0)
-              (my-struct-col vert)))
+  (defun funcall-g
+      "
+funcall-g is an experimental function. What it aims to allow you to do is to
+generate and run a pipeline which runs the requested function once with the
+given arguments on the GPU.
 
+By doing this it gives you a way to try out your gpu-functions from the REPL
+without having to make a pipeline map-g over it whilst use ssbos or
+transform-feedback to capture the result.
 
-{0} So like the normal lambda we specify the arguments (as a list) first
+Currently this only works with functions that would work within a vertex
+shader  (so things like gl-frag-pos will not work) however we want to expand on
+this in the future.
 
-{1} The &uniform lambda keyword says that arguments following it are 'uniform
-    arguments'. A uniform is an argument which has the same value for the entire
-    stage.
-    &optional and &key are not supported
+This is not intended to be used *anywhere* where performance matters, it was
+made solely as a debugging/development aid. Every time it is run it must:
 
-{2} Here is our definition for the uniform value. If used in a pipeline as a
-    vertex shader #'example will be called once for every value in the
-    `buffer-stream` given. That means the 'vert' argument will have a different value
-    for each of the potentially millions of invocations in that ONE pipeline
-    call, however 'loop' will have the same value for the entire pipeline call.
+- generate a pipeline
+- compile it
+- map-g over it
+- marshal the results back to lisp
+- free the pipeline
 
-{2 & 3} All arguments must have their types declared
+This is *extremly* expensive, however as long as it takes less that 20ms or so
+it is fast enough for use from the repl.
+")
+  (defstruct compile-context
+    "
+In the `lambda-list` for a `gpu-function`, glsl-stage or gpu lambda you can
+include the `&context` symbol which indicates that the remaining forms in the
+lambda-list are information about the context for the gpu-function to be
+compiled in.
 
-{4} Here we see we are using CL's values special form. CEPL fully supports
-    multiple value return in your shaders. If our function #'example was called
-    from another gpu-function then you can use multiple-value-bind to bind the
-    returned values. If however our example function were used as a stage in a
-    pipeline then the multiple returned values will be mapped to the multiple
-    arguments of the next stage in the pipeline.
+In pipelines (either defiend by `defpipeline-g` or `pipeline-g`) there is a
+context parameter which is a list of forms which represent information about
+the context for the pipeline to be compiled in.
 
-That's the basics of gpu-functions. For more details on how they can be used
-in pipelines please see the documentation for defpipeline-g.
+### The Data
+
+The `compile-context` holds a few pieces of information:
+
+- GLSL Versions
+ - in the case of `gpu-function`s and glsl stages this is used to specify what
+   GLSL versions this is valid for.
+ - in the case of pipelines this is used to specify what version of GLSL will
+   be used to compile this pipeline.
+- Primitive
+ - in the case of gpu-functions and glsl-stages this is used to specify what
+   primitive is valid. This can be used to ensure that a specific
+   `gpu-function` or glsl-stage that works on `:lines` is never used in a
+   `pipeline` processing `:triangles`.
+ - in the case of pipelines this is used to specify what primitive this
+   pipeline takes. Any `buffer-stream` passed to this pipeline will be checked
+   to ensure it contains the correct primitive. To specify this please refer
+   to the  :primitive argument in `make-buffer-stream` or the
+   `buffer-stream-primitive` function.
+- Stage Restrictive
+ - Not valid for pipelines. This lets the you declare what stage the
+   gpu-function or glsl stage is valid for.
+- Static
+ - For all targets this tells CEPL that the function, glsl stage or
+   pipeline is never going to be modified again. This allows CEPL to statically
+   define some types and also elide the code that would usually cause
+   recompilation when a gpu-function this is used by this
+   pipeline/stage/function is recompiled.
+
+Most compile-context information is optional and the following defaults are used
+if the data is not provided:
+
+- GLSL Versions
+ - gpu-function/glsl-stage: When checking for errors CEPL will allow
+   functions/types/etc from any glsl version to be used.
+ - pipeline: CEPL will look at the GL version of the context to determine the
+   most recent version of GLSL that it can used.
+- Primitive
+ - gpu-function/glsl-stage: By default there is no restriction applied
+ - pipeline: By default :triangles are assumed
+- Stage
+ - pipelines/gpu-functions: Always NIL by default
+ - glsl-stages: Mandatory
+- Static
+ - Always NIL by default
+
+### How it is specified
+
+The context designations are:
+
+Static:
+
+The symbol :static can appear at most once in the context list
+
+Versions:
+
+0 or more of the following can appear in the context list
+
+- :140
+- :150
+- :330
+- :400
+- :410
+- :420
+- :430
+- :440
+- :450
+- :460
+
+Stage:
+
+At most 1 of the following:
+- :vertex
+- :tessellation-control
+- :tessellation-evaluation
+- :geometry
+- :fragment
+- :compute
+
+Primitive:
+
+At most 1 of the following can appear in the context list
+- :dynamic
+- :points
+- :lines
+- :iso-lines
+- :line-loop
+- :line-strip
+- :lines-adjacency
+- :line-strip-adjacency
+- :triangles
+- :triangle-fan
+- :triangle-strip
+- :triangles-adjacency
+- :triangle-strip-adjacency
+- (:patch <patch length>)
+
+Note: :dynamic is special. It means that the pipeline will take the primitive
+kind from the buffer-stream being mapped over. This won't work for with
+pipelines with geometry or tessellation stages, but it otherwise can be useful.
+
+### Example
+
+    (defpipeline-g draw-sphere ((:patch 3) :440 :static)
+      :vertex (sphere-vert g-pnt)
+      :tessellation-control (sphere-tess-con (:vec3 3))
+      :tessellation-evaluation (sphere-tess-eval (:vec3 3))
+      :geometry (sphere-geom (:vec3 3) (:vec3 3))
+      :fragment (sphere-frag :vec3 :vec3 :vec3))
+
+This pipeline takes 3 component patches, requires at least GLSL 440 and has
+declared that it will not be recompiled (and as such will not take part in
+live recompilation).
+
+    (defun-g saturate ((val :dvec4) &context :410 :420 :430 :440 :450 :460)
+      (clamp val 0d0 1d0))
+
+This gpu-function is restricted to only work on version of GLSL between
+410 & 460
+
+    (def-glsl-stage frag-glsl ((\"color_in\" :vec4) &context :330 :fragment)
+      \"void main() {
+           color_out = v_in.color_in;
+       }\"
+      ((\"color_out\" :vec4)))
+
+This glsl-stage has stated it is to be used as a fragment stage as it only
+valid for GLSL version 330.
 "))

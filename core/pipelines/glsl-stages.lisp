@@ -28,6 +28,11 @@
        (alexandria:read-file-into-string fspec)))
     (t (error "def-glsl-stage: Invalid shader body ~a" body))))
 
+(defun get-stage-kind-from-context (context)
+  (find-if (lambda (x)
+             (member x varjo:*stage-names*))
+           context))
+
 ;; extract details from args and delegate to %def-gpu-function
 ;; for the main logic
 (defmacro def-glsl-stage (name args body-form outputs)
@@ -41,38 +46,36 @@
   ;;     calling it cpu side.
   ;;
   ;; split the argument list into the categoried we care about
-  (assoc-bind ((in-args nil) (uniforms :&uniform) (context :&context)
-               (instancing :&instancing))
-      (varjo.utils:lambda-list-split '(:&uniform :&context :&instancing) args)
+  (assoc-bind ((in-args nil) (uniforms :&uniform) (raw-context :&context)
+               (shared :&shared))
+      (varjo.utils:lambda-list-split '(:&uniform :&context :&shared) args)
     ;; check the arguments are sanely formatted
     (mapcar #'(lambda (x) (assert-glsl-arg-format name x)) in-args)
     (mapcar #'(lambda (x) (assert-glsl-arg-format name x)) uniforms)
+    (assert (not shared) ()
+            "CEPL: Shared variables are not yet supported in GLSL stages")
     ;; check we can use the type from glsl cleanly
     (assert-glsl-stage-types in-args uniforms)
     ;; now the meat
-    (assert-context name context)
-    (let* ((cepl-in-args (mapcar #'process-glsl-arg in-args))
+    (let* ((compile-context (parse-compile-context name raw-context
+                                                   :glsl-stage))
+           (cepl-in-args (mapcar #'process-glsl-arg in-args))
            (cepl-uniforms (mapcar #'process-glsl-arg uniforms))
            (body-string (get-body-string body-form))
-           (stage-kind (varjo.internals:get-stage-kind-from-context context))
-           (context (remove stage-kind context))
+           (stage-kind (get-stage-kind-from-context raw-context))
+           (primitive (compile-context-primitive compile-context))
            (spec (%make-glsl-stage-spec ;;[0]
-                  name cepl-in-args cepl-uniforms context body-string
+                  name cepl-in-args cepl-uniforms compile-context body-string
                   (varjo.internals:glsl-to-compile-result ;;[1]
-                   stage-kind in-args uniforms outputs context body-string))))
+                   stage-kind in-args uniforms outputs
+                   (compile-context-versions compile-context)
+                   body-string
+                   primitive))))
       (%update-glsl-stage-data spec)
       `(progn
          ,(%make-stand-in-lisp-func-for-glsl-stage spec);;[2]
          (recompile-pipelines-that-use-this-as-a-stage ,(spec->func-key spec))
          ',name))))
-
-(defun+ assert-context (name context)
-  (let ((allowed (and (some (lambda (s) (member s context))
-                            varjo:*stage-names*)
-                      (some (lambda (s) (member s context))
-                            varjo:*supported-versions*))))
-    (unless allowed
-      (error 'invalid-context-for-def-glsl-stage :name name :context context))))
 
 (defun+ type-contains-structs (type)
   (cond

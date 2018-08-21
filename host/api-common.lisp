@@ -56,7 +56,7 @@
     (funcall make-current-func gl-context surface))
 
   (defun register-event-listener (function)
-    "not external"
+    "Register a function to be called on each event from the host"
     (if reg-event-callback-func
         (funcall reg-event-callback-func function)
         (push function event-callbacks-cache))))
@@ -76,6 +76,15 @@
 (defun make-gl-context (&rest args &key &allow-other-keys)
   (assert *current-host* () "CEPL: make-gl-context cannot be called yet as CEPL has not been initialized")
   (apply #'%make-gl-context *current-host* args))
+
+;;----------------------------------------------------------------------
+
+(defun make-gl-context-shared-with-current-context (&rest args &key &allow-other-keys)
+  ;; This api is more restrictive that I would like, however it is what is
+  ;; supported by SDL2 and is easy enough to implement in a more expressive
+  ;; host.
+  (assert *current-host* () "CEPL: make-gl-context cannot be called yet as CEPL has not been initialized")
+  (apply #'%make-gl-context-shared-with-current-context *current-host* args))
 
 ;;----------------------------------------------------------------------
 
@@ -148,5 +157,15 @@
 (defun set-surface-title (surface title &rest args &key &allow-other-keys)
   (assert *current-host* () "CEPL: surface-title cannot be called yet as CEPL has not been initialized")
   (apply #'%set-surface-title *current-host* surface title args))
+
+;;----------------------------------------------------------------------
+
+(defmethod %destroy-surface (host surface &key &allow-other-keys)
+  (declare (ignore host surface))
+  nil)
+
+(defun destroy-surface (surface &rest args &key &allow-other-keys)
+  (assert *current-host* () "CEPL: destroy-surface cannot be called yet as CEPL has not been initialized")
+  (apply #'%destroy-surface *current-host* surface args))
 
 ;;----------------------------------------------------------------------

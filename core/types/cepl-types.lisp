@@ -20,10 +20,14 @@
   '(unsigned-byte 32))
 
 (deftype elem-byte-size ()
-  '(unsigned-byte 16))
-
-(deftype row-byte-size ()
   '(unsigned-byte 32))
+
+(deftype gl-enum-value ()
+  '(unsigned-byte #.+gl-enum-size+))
+
+(deftype gl-sizei ()
+  ;; value has to be unsigned but the type is still signed
+  '(signed-byte 32))
 
 (deftype gbuf-byte-size ()
   '(unsigned-byte 32))
@@ -52,25 +56,32 @@
   (dimensions
    (error "cepl: c-array must be created with dimensions")
    :type list)
+  (total-size
+   (error "cepl: c-array must be created with total-size")
+   :type c-array-index)
   (element-type
    (error "cepl: c-array must be created with an element-type")
    :type symbol)
-  (element-byte-size
-   (error "cepl: c-array must be created with an element-byte-size")
-   :type elem-byte-size)
+  (sizes
+   (error "CEPL (BUG): c-array created without internal sizes")
+   :type (simple-array c-array-index (4)))
+  (row-alignment
+   (error "cepl: c-array must be created with a row-alignment")
+   :type (integer 1 8))
   (struct-element-typep nil :type boolean)
-  (row-byte-size
-   (error "cepl: c-array must be created with a pointer")
-   :type row-byte-size)
   (element-pixel-format nil :type (or null pixel-format))
   (element-from-foreign
    (error "cepl: c-array must be created with a from-foreign function")
-   :type function)
+   :type (function (foreign-pointer) t))
   (element-to-foreign
    (error "cepl: c-array must be created with a to-foreign function")
    :type (function (foreign-pointer t) t))
   (free #'cffi:foreign-free
    :type function))
+
+(defn-inline c-array-element-byte-size ((c-array c-array))
+    c-array-index
+  (aref (c-array-sizes c-array) 0))
 
 ;;------------------------------------------------------------
 
@@ -90,10 +101,6 @@
   ;; last-sampler-id is used for perf optimizations
   ;; on gl v<3.3
   (last-sampler-id 0 :type (signed-byte 32)))
-
-(defvar +null-texture+
-  (%%make-texture :type nil
-                  :image-format nil))
 
 (defn-inline active-texture-num ((num (unsigned-byte 16))) (values)
   (declare (profile t))
@@ -120,7 +127,10 @@
   (element-type nil :type symbol) ;; data-type
   (byte-size 0 :type gbuf-byte-size) ;; data-index-length
   (element-byte-size 0 :type elem-byte-size)
-  (offset-in-bytes-into-buffer 0 :type gbuf-byte-size)) ;; offset-in-bytes-into-buffer
+  (offset-in-bytes-into-buffer 0 :type gbuf-byte-size)
+  (element-pixel-format nil :type (or null pixel-format))
+  ;; to match c-array and occasionaly used by pbos
+  (row-alignment 1 :type (integer 1 8)))
 
 (defstruct (gpu-array-t (:constructor %make-gpu-array-t)
                         (:include gpu-array))
@@ -130,11 +140,6 @@
   (layer-num 0 :type (unsigned-byte 16))
   (face-num 0 :type (integer 0 5))
   (image-format nil :type symbol))
-
-;;------------------------------------------------------------
-
-(defvar +null-gpu-buffer+
-  (%make-gpu-buffer :arrays (make-array 0 :element-type 'gpu-array-bb)))
 
 ;;------------------------------------------------------------
 
@@ -160,6 +165,7 @@
   (lod-bias 0.0 :type single-float)
   (min-lod -1000.0 :type single-float)
   (max-lod 1000.0 :type single-float)
+  (border-color (vec4 0f0 0f0 0f0 0f0) :type vec4)
   (expects-mipmap nil :type boolean)
   (minify-filter :linear :type keyword)
   (magnify-filter :linear :type keyword)
@@ -185,6 +191,15 @@
 (defstruct (ubo (:constructor %make-ubo))
   (id 0 :type gl-id)
   (data (error "gpu-array must be provided when making ubo")
+        :type gpu-array-bb)
+  (index 0 :type c-array-index)
+  (owns-gpu-array nil :type boolean))
+
+;;------------------------------------------------------------
+
+(defstruct (ssbo (:constructor %make-ssbo))
+  (id 0 :type gl-id)
+  (data (error "gpu-array must be provided when making ssbo")
         :type gpu-array-bb)
   (index 0 :type c-array-index)
   (owns-gpu-array nil :type boolean))
@@ -241,45 +256,21 @@
 
 ;;------------------------------------------------------------
 
+(defstruct (render-buffer (:constructor %make-render-buffer)
+                          (:conc-name %render-buffer-))
+  (id 0 :type gl-id)
+  (image-format (error "bug") :type symbol)
+  (resolution (error "bug: render-buffer resolution not provided") :type vec2)
+  (multisample-p nil :type boolean))
+
+;;------------------------------------------------------------
+
 (defstruct att
-  (array nil :type (or null gpu-array-t))
+  (array nil :type (or null gpu-array-t render-buffer))
   (blend nil :type boolean)
   (bparams nil :type (or null blending-params))
   (owned-p nil :type boolean)
   (viewport nil :type (or null viewport)))
-
-(defvar +null-att+
-  (make-att))
-
-;;------------------------------------------------------------
-
-(defstruct (fbo (:constructor %%make-fbo)
-                (:conc-name %fbo-))
-  (id 0 :type gl-id)
-  ;;
-  (color-arrays (make-array 0 :element-type 'att
-                            :initial-element +null-att+ :adjustable t
-                            :fill-pointer 0)
-                :type (array att *))
-  (depth-array (make-att) :type att)
-  (stencil-array (make-att) :type att)
-  ;;
-  (draw-buffer-map
-   (error "draw-buffer array must be provided when initializing an fbo"))
-  (clear-mask (cffi:foreign-bitfield-value
-               '%gl::ClearBufferMask '(:color-buffer-bit))
-              :type fixnum)
-  (is-default nil :type boolean)
-  (blending-params (make-blending-params :mode-rgb :func-add
-                                         :mode-alpha :func-add
-                                         :source-rgb :one
-                                         :source-alpha :one
-                                         :destination-rgb :zero
-                                         :destination-alpha :zero)
-                   :type blending-params))
-
-(defvar +null-fbo+
-  (%%make-fbo :draw-buffer-map (cffi:null-pointer)))
 
 ;;------------------------------------------------------------
 
@@ -295,9 +286,6 @@
 
 (deftype vao-id ()
   '(unsigned-byte 32))
-
-(declaim (type vao-id +null-vao+))
-(defvar +null-vao+ 0)
 
 ;;------------------------------------------------------------
 
@@ -375,6 +363,15 @@
 
 ;;------------------------------------------------------------
 
+(defstruct (compute-space
+             (:constructor make-compute-space
+                           (&optional (size-x 1) (size-y 1) (size-z 1))))
+  (size-x 1 :type (unsigned-byte 32))
+  (size-y 1 :type (unsigned-byte 32))
+  (size-z 1 :type (unsigned-byte 32)))
+
+;;------------------------------------------------------------
+
 (defstruct (buffer-stream (:constructor %make-buffer-stream))
   (vao 0 :type gl-id)
   (%start 0 :type (unsigned-byte 64))
@@ -429,7 +426,7 @@
     (unsigned-byte 8)
   (declare (profile t))
   (typecase prim
-    (varjo::patches (the (unsigned-byte 8) (varjo::vertex-count prim)))
+    (varjo::patches (coerce (varjo::vertex-count prim) '(unsigned-byte 8)))
     (varjo::triangles 3)
     (varjo::lines 2)
     (varjo::points 1)
@@ -511,6 +508,151 @@
 
 ;;------------------------------------------------------------
 
+(defstruct (transform-feedback-stream
+             (:constructor %make-tfs)
+             (:conc-name %tfs-))
+  (arrays nil :type (or null (array gpu-array-bb (*))))
+  (pending-arrays nil :type (or null (array gpu-array-bb (*))))
+  (bound nil :type boolean)
+  (current-prog-id +unknown-gl-id+ :type gl-id))
+
+;;------------------------------------------------------------
+
+(defstruct (empty-fbo-params
+             (:conc-name %empty-fbo-params-))
+  ;; setting dummy values here knowing that only internal code
+  ;; should be creating this
+  (fbo nil :type (or null fbo))
+  (dimensions nil :type list)
+  (viewport (%make-viewport) :type viewport)
+  (layer-count 0 :type unsigned-byte)
+  (samples 0 :type unsigned-byte)
+  (fixed-sample-locations-p nil :type boolean))
+
+(defstruct (fbo (:constructor %%make-fbo)
+                (:conc-name %fbo-))
+  (id 0 :type gl-id)
+  ;; Once empty info is set we never remove it, we track emptiness with the
+  ;; attachment-count slot
+  (empty-params nil :type (or null empty-fbo-params))
+  (color-arrays (make-array 0 :element-type 'att
+                            :initial-element (symbol-value '+null-att+)
+                            :adjustable t
+                            :fill-pointer 0)
+                :type (array att *))
+  (depth-array (make-att) :type att)
+  (stencil-array (make-att) :type att)
+  ;;
+  (draw-buffer-map
+   (error "draw-buffer array must be provided when initializing an fbo"))
+  (clear-mask (cffi:foreign-bitfield-value
+               '%gl::ClearBufferMask '(:color-buffer-bit))
+              :type fixnum)
+  (is-default nil :type boolean)
+  (attachment-count 0 :type (unsigned-byte 8))
+  (blending-params (make-blending-params :mode-rgb :func-add
+                                         :mode-alpha :func-add
+                                         :source-rgb :one
+                                         :source-alpha :one
+                                         :destination-rgb :zero
+                                         :destination-alpha :zero)
+                   :type blending-params))
+
+(defn-inline fbo-empty-p ((fbo fbo)) boolean
+  (declare (speed 3) (debug 0) (safety 1))
+  (= (%fbo-attachment-count fbo) 0))
+
+;;------------------------------------------------------------
+
+(defstruct (gpu-fence (:constructor %make-gpu-fence (obj))
+                      (:conc-name %gpu-fence-))
+  (obj (null-pointer) :type foreign-pointer))
+
+;;------------------------------------------------------------
+
+;; not normal to have the id generation here but then we can
+;; use boa-constructors
+
+(defn gen-query-id () gl-id
+  (with-foreign-object (id '%gl:uint)
+    (%gl:gen-queries 1 id)
+    (mem-aref id '%gl:uint)))
+
+(defstruct (gpu-query
+             (:constructor make-gpu-query ()))
+  (id (gen-query-id) :type gl-id :read-only t)
+  (enum 0 :type (signed-byte 32) :read-only t)
+  (cache-id 7 :type (integer 0 7) :read-only t))
+
+(defstruct (timestamp-query
+             (:constructor make-timestamp-query ())
+             (:include gpu-query
+                       (enum #.(gl-enum :timestamp)
+                             :type (signed-byte 32)
+                             :read-only t)
+                       (cache-id 0 :type (integer 0 7)
+                                 :read-only t))))
+
+(defstruct (scoped-gpu-query
+             (:include gpu-query))
+  (active-p nil :type boolean))
+
+(defstruct (samples-passed-query
+             (:constructor make-samples-passed-query ())
+             (:include scoped-gpu-query
+                       (enum #.(gl-enum :samples-passed)
+                             :type (signed-byte 32)
+                             :read-only t)
+                       (cache-id 1 :type (integer 0 7)
+                                 :read-only t))))
+
+(defstruct (any-samples-passed-query
+             (:constructor make-any-samples-passed-query ())
+             (:include scoped-gpu-query
+                       (enum #.(gl-enum :any-samples-passed)
+                             :type (signed-byte 32)
+                             :read-only t)
+                       (cache-id 2 :type (integer 0 7)
+                                 :read-only t))))
+
+(defstruct (any-samples-passed-conservative-query
+             (:constructor make-any-samples-passed-conservative-query ())
+             (:include scoped-gpu-query
+                       (enum #.(gl-enum :any-samples-passed-conservative)
+                             :type (signed-byte 32)
+                             :read-only t)
+                       (cache-id 3 :type (integer 0 7)
+                                 :read-only t))))
+
+(defstruct (primitives-generated-query
+             (:constructor make-primitives-generated-query ())
+             (:include scoped-gpu-query
+                       (enum #.(gl-enum :primitives-generated)
+                             :type (signed-byte 32)
+                             :read-only t)
+                       (cache-id 4 :type (integer 0 7)
+                                 :read-only t))))
+
+(defstruct (transform-feedback-primitives-written-query
+             (:constructor make-transform-feedback-primitives-written-query ())
+             (:include scoped-gpu-query
+                       (enum #.(gl-enum :transform-feedback-primitives-written)
+                             :type (signed-byte 32)
+                             :read-only t)
+                       (cache-id 5 :type (integer 0 7)
+                                 :read-only t))))
+
+(defstruct (time-elapsed-query
+             (:constructor make-time-elapsed-query ())
+             (:include scoped-gpu-query
+                       (enum #.(gl-enum :time-elapsed)
+                             :type (signed-byte 32)
+                             :read-only t)
+                       (cache-id 6 :type (integer 0 7)
+                                 :read-only t))))
+
+;;------------------------------------------------------------
+
 (defun+ holds-gl-object-ref-p (object)
   (typecase object
     (texture t)
@@ -523,60 +665,110 @@
     (fbo t) ;; 20160402 - only one left to delay
     (buffer-stream t)))
 
+(defgeneric can-be-shared-between-contexts-p (object)
+  (:method ((object gpu-buffer)) t)
+  (:method ((object gpu-array)) t)
+  ;; (:method (object query) t)
+  ;; (:method (object render-buffer) t)
+  (:method ((object sampler)) t)
+  (:method ((object texture)) t)
+  (:method ((object fbo)) nil)
+  ;;(:method (object pipeline) nil)
+  (:method ((object transform-feedback-stream)) nil)
+  (:method ((object buffer-stream)) nil))
+
 ;;------------------------------------------------------------
 
-(defvar +null-gpu-buffer+
-  (%make-gpu-buffer :arrays (make-array 0 :element-type 'gpu-array-bb)))
+#+sbcl
+(declaim (sb-ext:freeze-type fbo))
 
-(defun+ make-uninitialized-texture (&optional buffer-backed-p)
-  (if buffer-backed-p
-      (%%make-buffer-texture
-       :type :uninitialized
-       :image-format :uninitialized
-       :backing-array (make-uninitialized-gpu-array-bb))
-      (%%make-texture
-       :type :uninitialized :image-format :uninitialized)))
+#+sbcl
+(declaim (sb-ext:freeze-type ubo))
 
-(defun+ make-uninitialized-gpu-array-bb (&optional buffer)
-  (%make-gpu-array-bb
-   :buffer (or buffer +null-gpu-buffer+)
-   :access-style :uninitialized))
+#+sbcl
+(declaim (sb-ext:freeze-type ssbo))
 
-(defun+ make-uninitialized-gpu-array-t ()
-  (%make-gpu-array-t
-   :texture +null-texture+
-   :texture-type :uninitialized))
+#+sbcl
+(declaim (sb-ext:freeze-type viewport))
 
-(defun+ make-uninitialized-sampler (texture context-id)
-  (%make-sampler
-   :context-id context-id
-   :texture texture
-   :type :uninitialized))
+#+sbcl
+(declaim (sb-ext:freeze-type blending-params))
 
-(defun+ make-uninitialized-fbo ()
-  (%%make-fbo
-   :draw-buffer-map nil
-   :clear-mask -13))
+#+sbcl
+(declaim (sb-ext:freeze-type stencil-params))
 
-(defun+ make-uninitialized-buffer-stream (primitive)
-  (make-raw-buffer-stream :index-type :uninitialized
-                          :primitive primitive))
+#+sbcl
+(declaim (sb-ext:freeze-type render-buffer))
 
-(defvar +null-texture-backed-gpu-array+
-  (%make-gpu-array-t
-   :texture +null-texture+
-   :texture-type nil))
+#+sbcl
+(declaim (sb-ext:freeze-type att))
 
-(defvar +null-buffer-backed-gpu-array+
-  (%make-gpu-array-bb :buffer +null-gpu-buffer+
-                      :access-style :invalid
-                      :element-type nil
-                      :byte-size 0
-                      :offset-in-bytes-into-buffer 0))
+#+sbcl
+(declaim (sb-ext:freeze-type pixel-format))
 
-(defvar +uninitialized-buffer-array+
-  (make-array 0 :element-type 'gpu-array-bb
-              :initial-element +null-buffer-backed-gpu-array+))
+#+sbcl
+(declaim (sb-ext:freeze-type compute-space))
 
-(defun+ make-uninitialized-gpu-buffer ()
-  (%make-gpu-buffer :id 0 :arrays +uninitialized-buffer-array+))
+;; Cant yet as is subclassed in nineveh
+;; #+sbcl
+;; (declaim (sb-ext:freeze-type buffer-stream))
+
+#+sbcl
+(declaim (sb-ext:freeze-type transform-feedback-stream))
+
+#+sbcl
+(declaim (sb-ext:freeze-type c-array))
+
+#+sbcl
+(declaim (sb-ext:freeze-type texture))
+
+#+sbcl
+(declaim (sb-ext:freeze-type gpu-buffer))
+
+#+sbcl
+(declaim (sb-ext:freeze-type gpu-array))
+
+#+sbcl
+(declaim (sb-ext:freeze-type gpu-array-bb))
+
+#+sbcl
+(declaim (sb-ext:freeze-type gpu-array-t))
+
+#+sbcl
+(declaim (sb-ext:freeze-type buffer-texture))
+
+#+sbcl
+(declaim (sb-ext:freeze-type sampler-id-box))
+
+#+sbcl
+(declaim (sb-ext:freeze-type sampler))
+
+#+sbcl
+(declaim (sb-ext:freeze-type gpu-fence))
+
+#+sbcl
+(declaim (sb-ext:freeze-type gpu-query))
+
+#+sbcl
+(declaim (sb-ext:freeze-type timestamp-query))
+
+#+sbcl
+(declaim (sb-ext:freeze-type scoped-gpu-query))
+
+#+sbcl
+(declaim (sb-ext:freeze-type samples-passed-query))
+
+#+sbcl
+(declaim (sb-ext:freeze-type any-samples-passed-query))
+
+#+sbcl
+(declaim (sb-ext:freeze-type any-samples-passed-conservative-query))
+
+#+sbcl
+(declaim (sb-ext:freeze-type primitives-generated-query))
+
+#+sbcl
+(declaim (sb-ext:freeze-type transform-feedback-primitives-written-query))
+
+#+sbcl
+(declaim (sb-ext:freeze-type time-elapsed-query))

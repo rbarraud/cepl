@@ -8,19 +8,6 @@
 (deftype array-index ()
   '(integer 0 #.array-dimension-limit))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defmacro defun+ (name args &body body)
-    `(defun ,name ,args
-       ,@(parse-body+ name body '((profile t)))))
-
-  (defmacro defmethod+ (name &rest args)
-    (let* ((arg-pos (position-if #'listp args))
-           (qual (subseq args 0 arg-pos))
-           (body (subseq args (1+ arg-pos)))
-           (args (elt args arg-pos)))
-      `(defmethod ,name ,@qual ,args
-                  ,@(parse-body+ name body '((profile t)))))))
-
 (defun+ listify (x) (if (listp x) x (list x)))
 
 (defun+ n-of (thing count)
@@ -176,29 +163,6 @@
     (if source
         (rec source nil)
         nil)))
-
-(defvar safe-read-from-string-blacklist
-  '(#\# #\: #\|))
-
-(let ((rt (copy-readtable nil)))
-  (defun safe-reader-error (stream closech)
-    (declare (ignore stream closech))
-    (error "safe-read-from-string failure"))
-
-  (dolist (c safe-read-from-string-blacklist)
-    (set-macro-character
-     c #'safe-reader-error nil rt))
-
-  (defun safe-read-from-string (s &optional fail)
-    (if (stringp s)
-        (let ((*readtable* rt) *read-eval*)
-          (handler-bind
-              ((error (lambda (condition)
-                        (declare (ignore condition))
-                        (return-from
-                         safe-read-from-string fail))))
-            (read-from-string s)))
-        fail)))
 
 (defun+ sub-at-index (seq index new-val)
   (append (subseq seq 0 index)
@@ -431,9 +395,6 @@
     (cffi:foreign-pointer
      (%print-mem (cffi:inc-pointer thing offset)
                  size-in-bytes))
-    (autowrap:wrapper
-     (%print-mem (cffi:inc-pointer (autowrap:ptr thing) offset)
-                 size-in-bytes))
     (otherwise (format t "Error - Unsure how to print memory of object of type: ~a"
                        (type-of thing))))
   nil)
@@ -481,15 +442,6 @@
            ,(mapcar (lambda (k p) `(,(first p) (gethash ,k ,ht)))
                     keys var-key-pairs)
          ,@body))))
-
-(defun+ map-hash (function hash-table)
-  "map through a hash and actually return something"
-  (let* ((head (list nil))
-         (tail head))
-    (labels ((do-it (k v)
-               (rplacd tail (setq tail (list (funcall function k v))))))
-      (maphash #'do-it hash-table))
-    (cdr head)))
 
 (defun+ filter-hash (function hash-table)
   "map through a hash and actually return something"
@@ -664,25 +616,11 @@ source: ~s~%list-to-match: ~s" list list-to-match)
                (setf (fill-pointer ,gvec) (1+ ,gindex)))
              ,gindex)))))
 
-(defmacro def-artificial-id (name)
-  (let ((lowest (symb :*lowest-unused- name :-id*))
-        (freed (symb :*freed- name :-ids*))
-        (get (symb :get-free- name :-id))
-        (release (symb :release- name :-id)))
-    `(progn
-       (defvar ,lowest 0)
-       (defvar ,freed nil)
-       (defun ,get ()
-         (or (pop ,freed)
-             (incf ,lowest)))
-       (defun ,release (id)
-         (push id ,freed)))))
-
 (defun list-not-consp (x)
   (and (listp x) (or (null (cdr x)) (consp (cdr x)))))
 
-(defn gl-enum ((kwd symbol)) (signed-byte 32)
-  (the (signed-byte 32)
+(defn-inline gl-enum ((kwd symbol)) (unsigned-byte #.+gl-enum-size+)
+  (the (unsigned-byte #.+gl-enum-size+)
        (cffi:foreign-enum-value '%gl:enum kwd)))
 
 (defun symb-name= (a b)
@@ -739,3 +677,89 @@ source: ~s~%list-to-match: ~s" list list-to-match)
            ,@restores)))))
 
 ;;------------------------------------------------------------
+
+(defun consecutive-integers-p (integers)
+  (cond
+    ((rest integers) (loop :for (x y) :on integers :always
+                        (if y (= 1 (- y x)) t)))
+    ((first integers) (integerp (car integers)))
+    (t t)))
+
+;;------------------------------------------------------------
+
+(defun hidden-symb (symbol &optional sub-name)
+  (assert (symbolp symbol))
+  (intern (format nil "~a.~a~@[.~a~]"
+                  (package-name (symbol-package symbol))
+                  (symbol-name symbol)
+                  sub-name)
+          :cepl.hidden))
+
+;;------------------------------------------------------------
+
+(defmacro define-const (name val &key type)
+  "Differs from alexandrias define-context in that it wont eval the val form at
+   all if the var is already bound. This was we are always eq."
+  (when (and (boundp name) type)
+    (assert (typep (symbol-value name) type) ()
+            "
+DEFINE-CONST
+
+The definition was modified to set the type to however the type
+does not match the type of the value already bound to ~a
+
+Value: ~s
+Proposed Type: ~s" name (symbol-value name) type))
+  `(progn
+     ,@(when type `((declaim (type ,type ,name))))
+     (defconstant ,name
+       (if (boundp ',name)
+           (symbol-value ',name)
+           ,val))))
+
+;;------------------------------------------------------------
+
+(defmacro case= (form &body cases)
+  (let ((g (gensym "val")))
+    (labels ((wrap-case (c) `((= ,g ,(first c)) ,@(rest c))))
+      (let* ((cases-but1 (mapcar #'wrap-case (butlast cases)))
+             (last-case (car (last cases)))
+             (last-case (if (eq (car last-case) 'otherwise)
+                            `(t ,@(rest last-case))
+                            (wrap-case last-case)))
+             (cases (append cases-but1 (list last-case))))
+        `(let ((,g ,form))
+           (cond ,@cases))))))
+
+(defmacro ecase= (form &body cases)
+  (let ((gform (gensym "form")))
+    `(let ((,gform ,form))
+       (case= ,gform
+         ,@cases
+         (otherwise (error "~a fell through ecase=. Expected one of:~%~a"
+                           ',form ',(mapcar #'first cases)))))))
+
+;;------------------------------------------------------------
+
+(defmacro assert-lambda-list (lambda-list expression datum &rest arguments)
+  (let ((hacky-vars
+         (set-difference (remove-duplicates (flatten lambda-list))
+                         '(&optional &rest &body &key &allow-other-keys
+                           &aux &environment &whole nil t)
+                         :test #'string=)))
+    `(handler-case
+         (destructuring-bind ,lambda-list ,expression
+           (declare (ignore ,@hacky-vars))
+           nil)
+       (error () ,datum ,@arguments))))
+
+;;------------------------------------------------------------
+
+(defmacro vec-bind ((&rest vars) vec &body body)
+  (let ((gvec (gensym "vec")))
+    `(let* ((,gvec ,vec)
+            ,@(loop
+                 :for i :from 0
+                 :for var :in vars
+                 :collect `(,var (aref ,gvec ,i))))
+       ,@body)))

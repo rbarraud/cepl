@@ -13,19 +13,21 @@
 
 (defun+ initialize-cepl (&key gl-version host-init-flags)
   (when (uninitialized-p)
-    ;;
-    ;; Initialize Host
-    (unless cepl.host::*current-host*
-      (apply #'cepl.host::initialize host-init-flags))
-    ;;
-    ;; Initalized the already created CEPL contexts
-    (loop :for context :in cepl.context::*contexts* :do
-       (cepl.context::patch-uninitialized-context-with-version context gl-version)
-       (cepl.context::on-host-initialized context))
-    ;;
-    ;; Inform the world that CEPL is live
-    (cepl.lifecycle::change-state :interactive)
-    t))
+    (let ((contexts
+           (bt:with-lock-held (cepl.context::*contexts-lock*)
+             (copy-list cepl.context::*contexts*))))
+      ;;
+      ;; Initialize Host
+      (unless cepl.host::*current-host*
+        (apply #'cepl.host::initialize host-init-flags))
+      ;;
+      ;; Initalized the already created CEPL contexts
+      (loop :for context :in contexts :do
+         (cepl.context::patch-uninitialized-context-with-version context gl-version))
+      ;;
+      ;; Inform the world that CEPL is live
+      (cepl.lifecycle::change-state :active)
+      t)))
 
 (defun+ quit () (cepl.lifecycle::change-state :shutting-down))
 
@@ -55,6 +57,8 @@
       (clear) (swap))
     default-framebuffer))
 
+(defun cepl-describe (name &optional (stream *standard-output*))
+  (vari:vari-describe name stream))
 
 (in-package :cepl)
 

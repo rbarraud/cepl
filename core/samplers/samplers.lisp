@@ -2,10 +2,6 @@
 
 ;;----------------------------------------------------------------------
 
-(def-artificial-id fake-sampler)
-
-;;----------------------------------------------------------------------
-
 (defun+ sampler-texture (sampler)
   (%sampler-texture sampler))
 
@@ -147,7 +143,7 @@
   (cepl.context::if-gl-context
    (make-sampler-now %pre% lod-bias min-lod max-lod minify-filter
                      magnify-filter wrap compare)
-   (make-uninitialized-sampler texture (get-free-fake-sampler-id))
+   (make-uninitialized-sampler texture)
    (list texture)))
 
 ;;----------------------------------------------------------------------
@@ -170,16 +166,16 @@
   (check-sampler-feature)
   (make-default-sampler-id-box))
 
-(push #'sampler-on-context *on-context*)
-
 ;;----------------------------------------------------------------------
 
+(defvar *fake-sampler-id-lock* (bt:make-lock))
 (defvar *fake-sampler-id* 0)
 
 (defun+ %get-id ()
   (if *samplers-available*
       (first (gl:gen-samplers 1))
-      (decf *fake-sampler-id*)))
+      (bt:with-lock-held (*fake-sampler-id-lock*)
+        (decf *fake-sampler-id*))))
 
 (defun+ wrap-eq (wrap-a wrap-b)
   (loop :for a :across wrap-a
@@ -192,8 +188,11 @@
   (let ((wrap (if (keywordp wrap)
                   (vector wrap wrap wrap)
                   wrap)))
-    (if (and (= lod-bias 0.0) (= min-lod -1000.0) (= max-lod 1000.0)
-             (eq minify-filter :linear) (eq magnify-filter :linear)
+    (if (and (= lod-bias 0.0)
+             (= min-lod -1000.0)
+             (= max-lod 1000.0)
+             (eq minify-filter :linear)
+             (eq magnify-filter :linear)
              (wrap-eq wrap #(:repeat :repeat :repeat))
              (eq compare :none))
         *default-sampler-id-box*
@@ -205,7 +204,7 @@
     ;; change box
     ;; (in future we can look up based on some hash)
     (setf (%sampler-id-box sampler)
-          (make-sampler-id-box :id (%get-id))))
+          (make-sampler-id-box :id (%get-id) :shared-p nil)))
   sampler)
 
 
@@ -240,12 +239,10 @@
       (format stream "#<SAMPLER :UNINITIALIZED>")))
 
 (defun+ free-sampler (sampler)
+  ;; currently only shared sampler is the default one so not further
+  ;; checks neccessary.
   (unless (sampler-shared-p sampler)
-    ;; Be sure to add this back in when you implement freeing
-    ;; samplers.
-    ;; (release-fake-sampler-id (%sampler-context-id sampler))
-    (warn "CEPL: free-sampler not yet implemented~%leaking ~s"
-          sampler)))
+    (%delete-sampler sampler)))
 
 (defmethod free ((sampler sampler))
   (free-sampler sampler))
@@ -333,6 +330,25 @@
 
 ;;----------------------------------------------------------------------
 
+(defn border-color ((sampler sampler))
+    vec4
+  (%sampler-border-color sampler))
+
+(defn (setf border-color) ((value vec4) (sampler sampler)) vec4
+  (unless (eq (border-color sampler) value)
+    (let ((sampler (note-change sampler)))
+      (%set-border-color sampler value)))
+  value)
+
+;;----------------------------------------------------------------------
+
+(defn %set-border-color ((sampler sampler) (value vec4)) sampler
+  (setf (%sampler-border-color sampler) value)
+  (cffi-sys:with-pointer-to-vector-data (ptr value)
+    #+sbcl(declare (sb-ext:muffle-conditions sb-ext:compiler-note))
+    (%gl:sampler-parameter-fv (%sampler-id sampler) :texture-border-color ptr))
+  sampler)
+
 (defun+ %set-lod-bias (sampler value)
   (setf (%sampler-lod-bias sampler) value)
   (%gl:sampler-parameter-f (%sampler-id sampler) :texture-lod-bias value)
@@ -351,7 +367,7 @@
 (defun+ %set-magnify-filter (sampler value)
   (setf (%sampler-magnify-filter sampler) value)
   (%gl::sampler-parameter-i (%sampler-id sampler) :texture-mag-filter
-                            (%gl::foreign-enum-value '%gl:enum value))
+                            (gl-enum value))
   sampler)
 
 (defun+ %set-minify-filter (sampler value)
@@ -362,25 +378,36 @@
                                    :nearest-mipmap-nearest)))))
   (setf (%sampler-minify-filter sampler) value)
   (%gl::sampler-parameter-i (%sampler-id sampler) :texture-min-filter
-                            (%gl::foreign-enum-value '%gl:enum value))
+                            (gl-enum value))
   sampler)
 
 (defun+ %set-wrap (sampler value)
   (let ((options '(:repeat :mirrored-repeat :clamp-to-edge :clamp-to-border
-                   :mirror-clamp-to-edge))
-        (value (if (keywordp value)
-                   (vector value value value)
-                   value)))
-    (assert (and (vectorp value)
-                 (= (length value) 3)
-                 (every (lambda (x) (member x options)) value)))
-    (setf (%sampler-wrap sampler) value)
-    (%gl::sampler-parameter-i (%sampler-id sampler) :texture-wrap-s
-                              (%gl::foreign-enum-value '%gl:enum (aref value 0)))
-    (%gl::sampler-parameter-i (%sampler-id sampler) :texture-wrap-t
-                              (%gl::foreign-enum-value '%gl:enum (aref value 1)))
-    (%gl::sampler-parameter-i (%sampler-id sampler) :texture-wrap-r
-                              (%gl::foreign-enum-value '%gl:enum (aref value 2))))
+                   :mirror-clamp-to-edge)))
+    (let ((value (if (keywordp value)
+                     (progn
+                       (assert (find value options) ()
+                               'invalid-sampler-wrap-value
+                               :sampler sampler
+                               :value value)
+                       (vector value value value))
+                     (progn
+                       (assert (and (vectorp value)
+                                    (= (length value) 3)
+                                    (every (lambda (x) (member x options))
+                                           value))
+                               ()
+                               'invalid-sampler-wrap-value
+                               :sampler sampler
+                               :value value)
+                       value))))
+      (setf (%sampler-wrap sampler) value)
+      (%gl::sampler-parameter-i (%sampler-id sampler) :texture-wrap-s
+                                (gl-enum (aref value 0)))
+      (%gl::sampler-parameter-i (%sampler-id sampler) :texture-wrap-t
+                                (gl-enum (aref value 1)))
+      (%gl::sampler-parameter-i (%sampler-id sampler) :texture-wrap-r
+                                (gl-enum (aref value 2)))))
   sampler)
 
 (defun+ %set-compare (sampler value)
@@ -390,11 +417,10 @@
       (progn
         (%gl:sampler-parameter-i
          (%sampler-id sampler) :texture-compare-mode
-         (%gl::foreign-enum-value '%gl:enum :compare-ref-to-texture))
+         (gl-enum :compare-ref-to-texture))
         (%gl:sampler-parameter-i
          (%sampler-id sampler) :texture-compare-func
-         (%gl::foreign-enum-value
-          '%gl:enum
+         (gl-enum
           (case value
             ((:never nil) :never)
             ((:always t) :always)
@@ -407,12 +433,12 @@
             (otherwise (error "Invalid compare func for sampler ~a" value))))))
       (%gl:sampler-parameter-i
        (%sampler-id sampler) :texture-compare-mode
-       (%gl::foreign-enum-value '%gl:enum :none)))
+       (gl-enum :none)))
   sampler)
 
 ;;----------------------------------------------------------------------
 
-(defvar *sampler-types*
+(define-const +sampler-types+
   '(:isampler-1d :isampler-1d-array :isampler-2d :isampler-2d-array
     :isampler-2d-ms :isampler-2d-ms-array :isampler-2d-rect
     :isampler-3d :isampler-buffer :isampler-cube
@@ -442,7 +468,7 @@
     :usampler-buffer-arb :usampler-cube-arb :usampler-cube-array-arb))
 
 (defun+ sampler-typep (type)
-  (or (member type *sampler-types*)
+  (or (member type +sampler-types+)
       (varjo:v-typep type 'v-sampler)))
 
 (defun+ sampler-type (sampler)

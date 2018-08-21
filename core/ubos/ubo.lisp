@@ -2,13 +2,15 @@
 
 ;;---------------------------------------------------
 
+(defvar *ubo-id-lock* (bt:make-lock))
 (defvar *lowest-unused-ubo-id* 0)
 (defvar *freed-ubo-id* nil)
 
 (defun+ get-free-ubo-id ()
-  (if *freed-ubo-id*
-      (pop *freed-ubo-id*)
-      (incf *lowest-unused-ubo-id*)))
+  (bt:with-lock-held (*ubo-id-lock*)
+    (if *freed-ubo-id*
+        (pop *freed-ubo-id*)
+        (incf *lowest-unused-ubo-id*))))
 
 ;;---------------------------------------------------
 
@@ -19,12 +21,22 @@
 ;;---------------------------------------------------
 
 (defun+ make-ubo (data &optional element-type)
-  (let ((ubo (%make-ubo :id (get-free-ubo-id)
-                        :data (make-gpu-array
-                               (when data (vector data))
-                               :dimensions 1
-                               :element-type element-type)
-                        :index 0)))
+  (let* ((data (cond
+                 ((gpu-array-bb-p data)
+                  data)
+                 ((c-array-p data)
+                  (make-gpu-array
+                   data
+                   :dimensions 1
+                   :element-type element-type))
+                 (t (make-gpu-array
+                     (when data (vector data))
+                     :dimensions 1
+                     :element-type element-type))))
+         (ubo (%make-ubo
+               :id (get-free-ubo-id)
+               :data data
+               :index 0)))
     (%bind-ubo ubo)))
 
 
@@ -77,12 +89,16 @@ should be ~s" data element-type)
 ;; {TODO} using the id as the binding point is crazy town as it doesnt
 ;;        take :max-uniform-buffer-bindings into account.
 ;;        (For example it's only 84 on my desktop)
+;;
+;;        Ok, not quite as drastic as assumed, ubo-id is artificial and
+;;        we always make it as low as possible. However we should get
+;;        the max on cepl init, and check on ubo construction.
 (defun+ %bind-ubo (ubo)
   (let* ((data (ubo-data ubo))
          (type (ubo-data-type ubo))
          (offset (+ (gpu-array-bb-offset-in-bytes-into-buffer data)
                     (cepl.c-arrays::gl-calc-byte-size
-                     type (list (ubo-index ubo)))))
+                     type (list (ubo-index ubo)) 1)))
          (size (gl-type-size type))
          (gpu-buffer (gpu-array-buffer data)))
     (cepl.context::ubo-bind-buffer-id-range
@@ -95,27 +111,63 @@ should be ~s" data element-type)
 
 ;;---------------------------------------------------
 
-(defmethod push-g ((object c-array) (destination ubo))
-  (push-g object (subseq-g (ubo-data destination) 0 1)))
+(defn copy-c-array-to-ubo ((src c-array) (dst ubo))
+    ubo
+  (cepl.gpu-arrays::copy-c-array-to-buffer-backed-gpu-array
+   src (subseq-g (ubo-data dst) 0 1))
+  dst)
 
-(defmethod push-g ((object list) (destination ubo))
-  (let ((g-array (ubo-data destination)))
+(defn copy-lisp-list-to-ubo ((src list)
+                             (dst ubo))
+    ubo
+  (let ((element-type (element-type (ubo-data dst))))
     (with-c-array-freed (arr (make-c-array
-                        (list object) :dimensions 1
-                        :element-type (element-type g-array)))
-      (push-g arr destination))))
+                              (list src)
+                              :dimensions 1
+                              :element-type element-type))
+      (copy-c-array-to-ubo arr dst))))
 
-(defmethod pull1-g ((object ubo))
-    (let* ((data (ubo-data object))
-           (x (cepl.gpu-arrays::gpu-array-pull-1
-               (subseq-g data 0 1)))
-           (r (aref-c x 0)))
-      (if (typep r 'autowrap:wrapper)
-          r
-          (progn (free-c-array x) r))))
+(defn copy-lisp-array-to-ubo ((src array)
+                              (dst ubo))
+    ubo
+  (let ((element-type (element-type (ubo-data dst))))
+    (with-c-array-freed (arr (make-c-array
+                              (list (row-major-aref src 0))
+                              :dimensions 1
+                              :element-type element-type))
+      (copy-c-array-to-ubo arr dst))))
+
+(defn copy-ubo-to-new-lisp-data ((src ubo)) t
+  (elt (cepl.gpu-arrays::copy-buffer-backed-gpu-array-to-new-lisp-data
+        (subseq-g (ubo-data src) 0 1))
+       0))
+
+(defn copy-ubo-to-new-c-array ((src ubo)) c-array
+  (let* ((data (ubo-data src)))
+    (cepl.gpu-arrays::copy-buffer-backed-gpu-array-to-new-c-array
+             (subseq-g data 0 1))))
+
+
+(defmethod push-g ((object c-array) (destination ubo))
+  (copy-c-array-to-ubo object destination))
+(defmethod push-g ((object list) (destination ubo))
+  (copy-lisp-list-to-ubo object destination))
+(defmethod push-g ((object array) (destination ubo))
+  (copy-lisp-array-to-ubo object destination))
+
 
 (defmethod pull-g ((object ubo))
-  (elt (pull-g (subseq-g (ubo-data object) 0 1)) 0))
+  (copy-ubo-to-new-lisp-data object))
+
+
+(defmethod copy-g ((source c-array) (destination ubo))
+  (copy-c-array-to-ubo source destination))
+(defmethod copy-g ((source list) (destination ubo))
+  (copy-lisp-list-to-ubo source destination))
+(defmethod copy-g ((source array) (destination ubo))
+  (copy-lisp-array-to-ubo source destination))
+(defmethod copy-g ((object ubo) (destination (eql :lisp)))
+  (copy-ubo-to-new-lisp-data object))
 
 ;;---------------------------------------------------
 

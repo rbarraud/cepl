@@ -16,7 +16,8 @@
                                                        stride-override
                                                        normalized
                                                        instance-divisor)
-  (let ((type (varjo:type-spec->type array-type)))
+  (let ((type (or (varjo.internals::try-type-spec->type array-type nil)
+                  (error 'bad-type-for-buffer-stream-data :type array-type))))
     (if (and (varjo:core-typep type) (not (varjo:v-typep type 'v-sampler)))
         (let ((slot-layout (cepl.types::expand-slot-to-layout
                             nil type normalized))
@@ -39,26 +40,18 @@
         (error "Type ~a is not known to cepl" type))))
 
 (defgeneric clear-gl-context-cache (object))
-(defgeneric s-arrayp (object))
-(defgeneric s-prim-p (spec))
-(defgeneric s-extra-prim-p (spec))
-(defgeneric s-def (spec))
 
 (defgeneric symbol-names-cepl-structp (sym))
 (defmethod symbol-names-cepl-structp ((sym t))
   nil)
-
-(defn-inline draw-buffer-enum ((buffer-num (signed-byte 32))) (signed-byte 32)
-  (declare (optimize (speed 3) (safety 1) (debug 1))
-           (profile t))
-  (+ buffer-num #.(gl-enum :draw-buffer0)))
 
 (defun+ surface-dimensions (surface)
   (cepl.host:window-size surface))
 
 (defun+ surface-resolution (surface)
   (dbind (x y) (window-dimensions surface)
-    (v! x y)))
+    (vec2 (coerce x 'single-float)
+          (coerce y 'single-float))))
 
 (defun+ window-dimensions (window)
   (warn "CEPL: window-dimensions is deprecated, please use surface-dimensions instead")
@@ -69,9 +62,7 @@
   (surface-resolution window))
 
 (defun+ gl-type-size (type)
-  (if (keywordp type)
-      (cffi:foreign-type-size type)
-      (autowrap:foreign-type-size type)))
+  (cffi:foreign-type-size type))
 
 (defun+ cffi-type->gl-type (type)
   (case type

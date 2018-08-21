@@ -3,16 +3,19 @@
 ;;------------------------------------------------------------
 ;; Clear Color
 
-(defun+ clear-color (cepl-context)
+(defun+ clear-color (&optional (cepl-context (cepl-context)))
   (%with-cepl-context-slots (clear-color) cepl-context
     clear-color))
 
-(defn (setf clear-color) ((vec4-color vec4) (cepl-context cepl-context))
+(defn (setf clear-color)
+    ((vec4-color vec4) &optional (cepl-context cepl-context (cepl-context)))
     vec4
-  (assert (typep vec4-color 'rtg-math.types:vec4))
+  (assert (typep vec4-color 'vec4))
   (%with-cepl-context-slots (clear-color) cepl-context
-    (%gl:clear-color (v:x vec4-color) (v:y vec4-color)
-                     (v:z vec4-color) (v:w vec4-color))
+    (%gl:clear-color (aref vec4-color 0)
+                     (aref vec4-color 1)
+                     (aref vec4-color 2)
+                     (aref vec4-color 3))
     (setf clear-color vec4-color)))
 
 ;;------------------------------------------------------------
@@ -29,7 +32,11 @@
     (simple-array boolean (4))
     (color-masks)
   (setf (aref color-masks index) value)
-  (%gl:color-mask-i index (x value) (y value) (z value) (w value))
+  (%gl:color-mask-i index
+                    (aref value 0)
+                    (aref value 1)
+                    (aref value 2)
+                    (aref value 3))
   value)
 
 (define-context-func color-masks ()
@@ -42,7 +49,10 @@
     (color-masks)
   (loop :for i :below (length color-masks) :do
      (setf (aref color-masks i) value))
-  (%gl:color-mask (x value) (y value) (z value) (w value))
+  (%gl:color-mask (aref value 0)
+                  (aref value 1)
+                  (aref value 2)
+                  (aref value 3))
   value)
 
 ;;------------------------------------------------------------

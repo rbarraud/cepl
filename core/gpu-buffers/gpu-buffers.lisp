@@ -8,8 +8,10 @@
 
 (defmethod print-object ((object gpu-buffer) stream)
   (if (initialized-p object)
-      (call-next-method object stream)
-      (format stream "#<GPU-BUFFER :UNITIALIZED>")))
+      (format stream "#<GPU-BUFFER ~a ~@[~a~]>"
+              (gpu-buffer-id object)
+              (map 'list #'gpu-array-bb-byte-size (gpu-buffer-arrays object)))
+      (format stream "#<GPU-BUFFER :UNINITIALIZED>")))
 
 (defmethod free ((object gpu-buffer))
   (free-buffer object))
@@ -48,15 +50,14 @@
 (defun+ gen-buffer ()
   (first (gl:gen-buffers 1)))
 
-(defun+ init-gpu-buffer-now (new-buffer gl-object initial-contents
-                            buffer-target usage)
+(defun+ init-gpu-buffer-now (new-buffer
+                             gl-object
+                             initial-contents
+                             buffer-target
+                             usage)
   (declare (symbol buffer-target usage))
   (with-cepl-context (ctx)
     (setf (gpu-buffer-id new-buffer) gl-object)
-    (setf (gpu-buffer-arrays new-buffer)
-          (make-array 0 :element-type 'gpu-array-bb
-                      :initial-element +null-buffer-backed-gpu-array+
-                      :adjustable t :fill-pointer 0))
     (cepl.context::register-gpu-buffer ctx new-buffer)
     (if initial-contents
         (if (list-of-c-arrays-p initial-contents)
@@ -65,16 +66,71 @@
                          :target buffer-target :usage usage))
         new-buffer)))
 
+(defun process-layout (layout)
+  (cond
+    ((and (integerp layout) (>= layout 0))
+     layout)
+    ((and (listp layout)
+          (find :dimensions layout)
+          (find :element-type layout))
+     (destructuring-bind (&key dimensions element-type) layout
+       (let* ((dimensions (listify dimensions))
+              (elem-count (reduce #'* dimensions))
+              (element-type (if (cepl.pixel-formats:pixel-format-p element-type)
+                                (pixel-format->lisp-type element-type)
+                                element-type)))
+         (* elem-count (gl-type-size element-type)))))
+    ((and (listp layout)
+          (eq (first layout) 'quote))
+     (error 'quote-in-buffer-layout :layout layout))
+    (t (error 'invalid-gpu-buffer-layout :layout layout))))
+
+(defun init-gpu-buffer-now-with-layouts (new-buffer
+                                         gl-object
+                                         layouts
+                                         usage
+                                         keep-data)
+  (declare (symbol usage))
+  (let* ((layouts (listify layouts))
+         (byte-sizes (mapcar #'process-layout layouts)))
+    (with-cepl-context (ctx)
+      (setf (gpu-buffer-id new-buffer) gl-object)
+      (cepl.context::register-gpu-buffer ctx new-buffer)
+      (if keep-data
+          (buffer-set-arrays-from-sizes new-buffer byte-sizes usage)
+          (buffer-reserve-blocks-from-sizes new-buffer
+                                            byte-sizes
+                                            :array-buffer
+                                            usage))
+      new-buffer)))
+
 (defun+ list-of-c-arrays-p (x)
   (and (listp x) (every #'c-array-p x)))
 
-(defun+ make-gpu-buffer-from-id (gl-object &key initial-contents
-                                            (buffer-target :array-buffer)
-                                            (usage :static-draw))
+(defun+ make-gpu-buffer-from-id (gl-object &rest args
+                                           &key initial-contents
+                                           layouts
+                                           (buffer-target :array-buffer)
+                                           (usage :static-draw)
+                                           (keep-data nil))
   (declare (symbol buffer-target usage))
-  (init-gpu-buffer-now
-   (make-uninitialized-gpu-buffer) gl-object initial-contents
-   buffer-target usage))
+  (assert (not (and layouts initial-contents)) ()
+          'make-gpu-buffer-from-id-clashing-keys
+          :args args)
+  (if layouts
+      (init-gpu-buffer-now-with-layouts (make-uninitialized-gpu-buffer)
+                                        gl-object
+                                        layouts
+                                        usage
+                                        keep-data)
+      (progn
+        (assert (not keep-data) () 'cannot-keep-data-when-uploading
+                :data initial-contents)
+        (init-gpu-buffer-now (make-uninitialized-gpu-buffer)
+                             gl-object
+                             initial-contents
+                             buffer-target
+                             usage))))
 
 (defun+ make-gpu-buffer (&key initial-contents
                           (buffer-target :array-buffer)
@@ -95,47 +151,27 @@
   (%gl:buffer-data target byte-size
                    (cffi:inc-pointer data-pointer byte-offset)
                    usage)
-  (setf (gpu-buffer-arrays buffer)
-        (make-array 1 :element-type 'gpu-array-bb :initial-element
-                    (%make-gpu-array-bb
-                     :dimensions (list byte-size)
-                     :buffer buffer
-                     :access-style usage
-                     :element-type :uint8
-                     :byte-size byte-size
-                     :offset-in-bytes-into-buffer 0)))
   buffer)
 
-(defun+ buffer-data (buffer c-array &key (target :array-buffer)
-                                     (usage :static-draw) (offset 0) byte-size)
-  (buffer-data-raw (pointer c-array)
-                   (or byte-size (cepl.c-arrays::c-array-byte-size c-array))
-                   buffer target usage (* offset (element-byte-size c-array))))
+(defun+ buffer-data (buffer
+                     c-array
+                     &key
+                     (target :array-buffer)
+                     (usage :static-draw)
+                     (offset 0)
+                     byte-size)
+  (let ((byte-size (or byte-size (cepl.c-arrays::c-array-byte-size c-array))))
+    (buffer-data-raw (pointer c-array)
+                     byte-size
+                     buffer target usage (* offset (element-byte-size c-array)))
+    (buffer-set-arrays-from-sizes buffer (list byte-size) usage)))
 
 (defun+ multi-buffer-data (buffer c-arrays target usage)
   (let* ((c-array-byte-sizes (loop :for c-array :in c-arrays :collect
-                                (cepl.c-arrays::c-array-byte-size c-array)))
-         (total-size (reduce #'+ c-array-byte-sizes)))
+                                (cepl.c-arrays::c-array-byte-size c-array))))
     (map nil #'free (gpu-buffer-arrays buffer))
     (setf (gpu-buffer-bound (cepl-context) target) buffer)
-    (buffer-reserve-block-raw buffer total-size target usage)
-    (buffer-data buffer (first c-arrays)
-                 :target target
-                 :usage usage
-                 :byte-size total-size)
-    (let ((offset 0))
-      (setf (gpu-buffer-arrays buffer)
-            (make-array
-             (length c-arrays) :element-type 'gpu-array-bb :initial-contents
-             (loop :for byte-size :in c-array-byte-sizes
-                :collect (%make-gpu-array-bb
-                          :dimensions (list byte-size)
-                          :buffer buffer
-                          :access-style usage
-                          :element-type :uint8
-                          :byte-size byte-size
-                          :offset-in-bytes-into-buffer offset)
-                :do (incf offset byte-size)))))
+    (buffer-reserve-blocks-from-sizes buffer c-array-byte-sizes target usage)
     (loop :for c :in c-arrays :for g :across (gpu-buffer-arrays buffer) :do
        (gpu-array-sub-data g c :types-must-match nil))
     buffer))
@@ -163,22 +199,46 @@ gpu-array: ~s (byte-size: ~s)"
   (%gl:buffer-data target byte-size (cffi:null-pointer) usage)
   buffer)
 
-(defun+ buffer-reserve-block (buffer type dimensions target usage)
+(defun+ buffer-reserve-block (buffer type dimensions target usage
+                                     &key (row-alignment 1))
   (unless dimensions (error "dimensions are not optional when reserving a buffer block"))
   (setf (gpu-buffer-bound (cepl-context) target) buffer)
   (let* ((dimensions (listify dimensions))
-         (byte-size (cepl.c-arrays::gl-calc-byte-size type dimensions)))
+         (byte-size (cepl.c-arrays::gl-calc-byte-size type dimensions
+                                                      row-alignment)))
     (buffer-reserve-block-raw buffer byte-size target usage)
-    (setf (gpu-buffer-arrays buffer)
-          (make-array 1 :element-type 'gpu-array-bb :initial-element
-                      (%make-gpu-array-bb
-                       :dimensions (list byte-size)
-                       :buffer buffer
-                       :access-style usage
-                       :element-type :uint8
-                       :byte-size byte-size
-                       :offset-in-bytes-into-buffer 0))))
+    (buffer-set-arrays-from-sizes buffer (list byte-size) usage))
   buffer)
+
+(defun+ buffer-reserve-blocks-from-sizes (buffer byte-sizes target usage)
+  (check-type byte-sizes list)
+  (let ((total-size (reduce #'+ byte-sizes)))
+    (setf (gpu-buffer-bound (cepl-context) target) buffer)
+    (buffer-reserve-block-raw buffer total-size target usage)
+    (buffer-set-arrays-from-sizes buffer byte-sizes usage)
+    buffer))
+
+(defun+ buffer-set-arrays-from-sizes (buffer byte-sizes usage)
+  (check-type byte-sizes list)
+  (map nil #'free (gpu-buffer-arrays buffer))
+  (let ((offset 0))
+    (setf (gpu-buffer-arrays buffer)
+          (make-array
+           (length byte-sizes)
+           :element-type 'gpu-array-bb
+           :initial-contents
+           (loop :for byte-size :in byte-sizes
+              :collect (%make-gpu-array-bb
+                        :dimensions (list byte-size)
+                        :buffer buffer
+                        :access-style usage
+                        :element-type :uint8
+                        :byte-size byte-size
+                        :offset-in-bytes-into-buffer offset
+                        :row-alignment 1)
+              :do (incf offset byte-size)))))
+  buffer)
+
 
 (defun+ reallocate-buffer (buffer)
   (assert (= (length (gpu-buffer-arrays buffer)) 1))
